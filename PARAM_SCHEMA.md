@@ -388,6 +388,69 @@ and `position_index` (0-based) fields. `substitute` switches to
 byte-index substitution for these, which `substituteDocxXml` does not
 currently support.
 
+### Cross-template `parties.json` registry (v0.6.0, opt-in)
+
+A repo-local `parties.json` declares known parties once; templates'
+schemas reference fields with `ref:parties.<party_key>.<field>`.
+Eliminates duplicating party metadata (name, state, CIK, signing
+contact) across every template.
+
+```json
+// parties.json
+{
+  "acme_corp": {
+    "name": "Acme Corporation",
+    "state": "Delaware",
+    "cik": "0001234567"
+  }
+}
+```
+
+```json
+// <template>.params.json
+{
+  "_meta": { "schema_version": 1 },
+  "party_a":       { "aliases": ["Party A"],       "default": "ref:parties.acme_corp.name" },
+  "party_a_state": { "aliases": ["Party A State"], "default": "ref:parties.acme_corp.state" }
+}
+```
+
+**Q2.1 locked:** default file location is `./parties.json` in the
+process CWD. Override with `--parties PATH`. Missing explicit path
+is exit 1 (`EXIT.IO`); missing default file silently means "no
+registry loaded" (refs then fail at resolution time with a clear hint).
+
+**Q2.2 locked:** refs resolve in `--params` JSON values and schema
+`default` values only. **CLI flag values pass through unchanged** —
+`--party-a "ref:parties.acme.name"` is treated as a literal string
+that happens to start with `ref:`. This keeps CLI parsing
+unambiguous and avoids users accidentally leaking parties data on
+the command line.
+
+**Q2.3 locked:** versioning is out of scope for v0.6.0. When a
+party's metadata changes in `parties.json`, all drafts that ref it
+produce different output if re-run. This is by design (single source
+of truth for party info), but worth knowing — historical drafts may
+diverge from their original `parties.json` values.
+
+**Ref syntax:** `ref:parties.<party_key>.<field>` where both
+`<party_key>` and `<field>` match `[A-Za-z_][A-Za-z0-9_]*`. Malformed
+refs, unknown party keys, and unknown fields all surface as hard
+errors before substitution (exit 4).
+
+**Resolution order:** value resolution → ref expansion → typed-param
+normalization → computed values → substitute. Refs run before typed
+normalization so a ref returning `"2027-01-15"` can still flow
+through `type: date` formatting.
+
+**Field-value coercion:** ref'd fields are coerced to strings via
+`String(value)` (e.g. `cik: 1234567` becomes `"1234567"`). The
+parties registry can store non-string values for ergonomics, but
+substitution always uses string output.
+
+Programmatic API: `loadParties(path)`, `resolveRef(value, parties)`,
+`resolveRefs(resolved, sources, parties)`.
+
 ### Orphan handling (Q4 locked)
 
 Schema declares a key whose alias list matches no detected phrase →

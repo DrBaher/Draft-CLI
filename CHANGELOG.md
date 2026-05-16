@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file. The
 format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to semantic versioning once it leaves 0.x.
 
+## 0.6.0 — 2026-05-16
+
+### Added
+
+- **Cross-template `parties.json` registry.** A repo-local
+  `parties.json` declares known parties once; templates' schemas
+  reference fields with `ref:parties.<key>.<field>`:
+  ```json
+  // parties.json
+  { "acme_corp": { "name": "Acme Corporation", "state": "Delaware" } }
+  ```
+  ```json
+  // <template>.params.json
+  {
+    "_meta": { "v": 1 },
+    "party_a":       { "aliases": ["Party A"],       "default": "ref:parties.acme_corp.name" },
+    "party_a_state": { "aliases": ["Party A State"], "default": "ref:parties.acme_corp.state" }
+  }
+  ```
+  Resolution happens between `resolveValues` and typed-parameter
+  normalization, so `ref:`-resolved values feed cleanly into
+  `type: date | money | party` flows.
+- **`--parties PATH` flag** overrides the default CWD/`parties.json`
+  lookup. Missing explicit path → exit 1 with a clear error.
+- **New public API:** `loadParties(path)`, `resolveRef(value, parties)`,
+  `resolveRefs(resolved, sources, parties)`.
+
+### Decisions locked (V2_BRIEFS_REMAINING Q2.1–Q2.3)
+
+- **Q2.1 File location:** default is `./parties.json` in CWD;
+  override with `--parties PATH`.
+- **Q2.2 Ref scope:** refs resolve in `--params` JSON and schema
+  `default` values only. CLI flag values with `ref:` prefix pass
+  through **unchanged** — they're treated as literal strings.
+- **Q2.3 Versioning:** out of scope for v0.6.0. When a party's
+  metadata changes in `parties.json`, all drafts that ref it produce
+  different output if re-run. Documented as a known property.
+
+### Schema-contract change
+
+`PARAM_SCHEMA.md` §5 gains a "Cross-template `parties.json` registry"
+subsection. v0.6.0 schemas are forward-compatible with v0.5.x
+readers — `ref:` strings just look like literal values to older
+readers (and won't substitute correctly, but won't error out either
+since "ref:..." is a valid string).
+
 ## 0.5.0 — 2026-05-16
 
 ### Added

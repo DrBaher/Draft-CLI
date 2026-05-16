@@ -70,7 +70,7 @@ import { fileURLToPath } from "node:url";
  */
 
 /** @type {string} */
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 // ─── EXIT CODES ─────────────────────────────────────────────────────────────
 /**
@@ -277,6 +277,7 @@ export function parseArgs(argv) {
     if (a === "--silent" || a === "-q") { opts.silent = true; continue; }
     if (a === "--diff") { opts.diff = true; continue; }
     if (a === "--params") { opts.params = argv[++i]; continue; }
+    if (a === "--parties") { opts.parties = argv[++i]; continue; }
     if (a === "--output" || a === "-o") { opts.output = argv[++i]; continue; }
     if (a === "--syntax") {
       const v = argv[++i];
@@ -1273,6 +1274,108 @@ export function loadParamsFile(path) {
 }
 
 /**
+ * Load a `parties.json` registry (v2 #5). Returns the parsed object or
+ * `null` if no file is present. Explicit `--parties PATH` errors if
+ * the path doesn't exist; the default `./parties.json` is treated as
+ * absent if the file isn't there (no error).
+ *
+ * @param {string | null} explicitPath — value of `--parties PATH`, or null
+ *   to auto-detect `./parties.json` in CWD.
+ * @returns {Object<string, Object<string, *>> | null}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing explicit file or invalid JSON.
+ */
+export function loadParties(explicitPath) {
+  const fallback = "parties.json";
+  const path = explicitPath || (existsSync(fallback) ? fallback : null);
+  if (!path) return null;
+  if (!existsSync(path)) {
+    const e = new Error(`parties file not found: ${path}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    const e = new Error(`could not parse ${path}: ${err.message}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const e = new Error(`parties file ${path} must be a JSON object`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  // Reject non-object party entries early so downstream `ref:` resolution
+  // can safely lookup fields without a per-call shape check.
+  for (const [partyKey, party] of Object.entries(parsed)) {
+    if (!party || typeof party !== "object" || Array.isArray(party)) {
+      const e = new Error(`parties file ${path}: entry "${partyKey}" must be a JSON object`);
+      e.exitCode = EXIT.IO;
+      throw e;
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Resolve a `ref:parties.<party>.<field>` reference against a loaded
+ * parties object. Throws on malformed ref, missing parties registry,
+ * unknown party, or unknown field. Non-`ref:` strings pass through
+ * unchanged.
+ *
+ * @param {string} value
+ * @param {Object<string, Object<string, *>> | null} parties
+ * @returns {string}
+ * @throws {Error} on malformed or unresolvable reference.
+ */
+export function resolveRef(value, parties) {
+  if (typeof value !== "string" || !value.startsWith("ref:")) return value;
+  if (!parties) {
+    throw new Error(`reference "${value}" but no parties.json loaded (pass --parties PATH or put parties.json in cwd)`);
+  }
+  const m = /^ref:parties\.([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
+  if (!m) {
+    throw new Error(`malformed reference "${value}" (expected "ref:parties.<party_key>.<field>")`);
+  }
+  const [, partyKey, fieldKey] = m;
+  const party = parties[partyKey];
+  if (!party) {
+    throw new Error(`unknown party "${partyKey}" in reference "${value}"`);
+  }
+  if (!(fieldKey in party)) {
+    throw new Error(`unknown field "${fieldKey}" on party "${partyKey}" in reference "${value}"`);
+  }
+  const out = party[fieldKey];
+  return out == null ? "" : String(out);
+}
+
+/**
+ * Walk a resolved-values map and replace any `ref:` strings with their
+ * resolved values from the parties registry. CLI-sourced values are
+ * left alone (Q2.2: refs are params/default only, never CLI). Collects
+ * all errors before returning so the user sees every failure at once.
+ *
+ * @param {Object<string,string>} resolved — mutated in place.
+ * @param {Object<string,string>} sources — from `resolveValues`.
+ * @param {Object<string, Object<string, *>> | null} parties
+ * @returns {{ ok: boolean, errors: Array<{ key: string, message: string }> }}
+ */
+export function resolveRefs(resolved, sources, parties) {
+  const errors = [];
+  for (const [key, value] of Object.entries(resolved)) {
+    if (sources[key] === "cli") continue; // Q2.2: CLI values pass through
+    if (typeof value !== "string" || !value.startsWith("ref:")) continue;
+    try {
+      resolved[key] = resolveRef(value, parties);
+    } catch (e) {
+      errors.push({ key, message: e.message });
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
  * Resolve a value for every placeholder using the locked precedence chain:
  * CLI flag > `--params` JSON > `--interactive` prompt > schema default >
  * (missing). Empty-string CLI values are considered supplied (not missing).
@@ -1912,7 +2015,7 @@ export async function cmdListPlaceholders(opts, input, schema, envObj, { fetcher
   return EXIT.OK;
 }
 
-export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err } = {}) {
+export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err, parties = null } = {}) {
   const result = await runCascade(input, opts, schema, envObj, { fetcher });
   if (result.tier === "none") {
     err.write(paint("error: no placeholders detected by any tier\n", "red", err));
@@ -1937,6 +2040,22 @@ export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetc
     printMissing(missing, err);
     if (opts.json) {
       out.write(JSON.stringify({ ok: false, missing: missing.map(m => m.key) }, null, 2) + "\n");
+    }
+    return EXIT.VALIDATION;
+  }
+  // v2 #5: parties.json ref resolution. Refs like
+  // `ref:parties.acme_corp.name` in --params or schema defaults expand
+  // before typed normalization. CLI values pass through unchanged.
+  const refCheck = resolveRefs(resolved, sources, parties);
+  if (!refCheck.ok) {
+    for (const re of refCheck.errors) {
+      err.write(paint(`error: parties reference failed for "${re.key}": ${re.message}\n`, "red", err));
+    }
+    if (opts.json) {
+      out.write(JSON.stringify({
+        ok: false,
+        ref_errors: refCheck.errors.map(({ key, message }) => ({ key, message })),
+      }, null, 2) + "\n");
     }
     return EXIT.VALIDATION;
   }
@@ -1977,7 +2096,7 @@ export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetc
   return EXIT.OK;
 }
 
-export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err } = {}) {
+export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err, parties = null } = {}) {
   const result = await runCascade(input, opts, schema, envObj, { fetcher });
   if (result.tier === "none") {
     const hasProvider = Boolean(llmProviderFromEnv(envObj));
@@ -2041,6 +2160,18 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
     printMissing(missing, err);
     if (unusedFlags.length > 0) {
       err.write(paint(`note: you also passed ${unusedFlags.map(u => `--${u.replace(/_/g, "-")}`).join(", ")} which did not match any placeholder.\n`, "yellow", err));
+    }
+    return EXIT.VALIDATION;
+  }
+
+  // v2 #5: parties.json ref resolution. Refs like
+  // `ref:parties.acme_corp.name` in --params or schema defaults expand
+  // before typed normalization. CLI values pass through unchanged
+  // (Q2.2 lock).
+  const refCheck = resolveRefs(resolved, sources, parties);
+  if (!refCheck.ok) {
+    for (const re of refCheck.errors) {
+      err.write(paint(`error: parties reference failed for "${re.key}": ${re.message}\n`, "red", err));
     }
     return EXIT.VALIDATION;
   }
@@ -2462,12 +2593,13 @@ export async function main(argv, io = {}) {
     return EXIT.IO;
   }
 
-  let input, schema, paramsObj, envObj;
+  let input, schema, paramsObj, envObj, parties;
   try {
     input = await resolveInput(opts.positional[0], { spawner, stdinReader });
     schema = loadSchema(input.path);
     paramsObj = loadParamsFile(opts.params);
     envObj = effectiveEnv(cwd, processEnv);
+    parties = loadParties(opts.parties || null);
   } catch (e) {
     err.write(paint(`error: ${e.message}\n`, "red", err));
     return e.exitCode || EXIT.IO;
@@ -2478,9 +2610,9 @@ export async function main(argv, io = {}) {
       return await cmdListPlaceholders(opts, input, schema, envObj, { fetcher, out, err });
     }
     if (opts.validate) {
-      return await cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err });
+      return await cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err, parties });
     }
-    return await cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err });
+    return await cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err, parties });
   } catch (e) {
     err.write(paint(`error: ${e.message}\n`, "red", err));
     return e.exitCode || EXIT.IO;
