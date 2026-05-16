@@ -107,7 +107,7 @@ export function llmProviderFromEnv(envObj) {
 // param resolution. Boolean flags listed in KNOWN_BOOLEAN; value flags in
 // KNOWN_VALUE. Everything else --x is treated as a param flag.
 const KNOWN_BOOLEAN = new Set([
-  "--help", "-h", "--version", "-V",
+  "--help", "-h", "--version", "-V", "--demo",
   "--validate", "--list-placeholders",
   "--why", "--json", "--interactive", "-i",
   "--no-heuristic", "--yes-heuristic",
@@ -130,6 +130,7 @@ export function parseArgs(argv) {
     listPlaceholders: false,
     why: false,
     json: false,
+    demo: false,
     noHeuristic: false,
     yesHeuristic: false,
     noLlm: false,
@@ -142,6 +143,7 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (a === "--help" || a === "-h") { opts.help = true; continue; }
     if (a === "--version" || a === "-V") { opts.version = true; continue; }
+    if (a === "--demo") { opts.demo = true; continue; }
     if (a === "--validate") { opts.validate = true; continue; }
     if (a === "--list-placeholders") { opts.listPlaceholders = true; continue; }
     if (a === "--why") { opts.why = true; continue; }
@@ -201,6 +203,7 @@ USAGE
   draft -                   (template body on stdin)
   draft --list-placeholders <template> [--json]
   draft --validate <template> --params FILE
+  draft --demo              (bundled demo, no file needed)
 
 DETECTION CASCADE  (sequential-with-stop; first non-empty tier wins)
   1. bracket        [Title Case]              deterministic, default on
@@ -1009,6 +1012,42 @@ async function confirmTty(prompt) {
   });
 }
 
+// ─── DEMO (bundled fixture for the 30-second first run) ────────────────────
+export const DEMO_TEMPLATE = `# Mutual Non-Disclosure Agreement (demo)
+
+This Agreement is entered into on [Effective Date] between [Party A]
+and [Party B] (collectively, the "Parties").
+
+1. Confidentiality. [Party A] and [Party B] agree to keep confidential
+   any information disclosed under this Agreement.
+
+2. Term. This Agreement remains in effect for two years from the
+   [Effective Date].
+`;
+
+export const DEMO_VALUES = {
+  party_a: "Acme Corporation",
+  party_b: "Vendor Inc.",
+  effective_date: "2026-06-01",
+};
+
+export function runDemo(out, err) {
+  const hits = detectBracket(DEMO_TEMPLATE);
+  const byKey = new Map();
+  for (const h of hits) {
+    const key = canonicalKey(h.inner);
+    if (!byKey.has(key)) byKey.set(key, { key, hits: [] });
+    byKey.get(key).hits.push(h);
+  }
+  const placeholders = [...byKey.values()];
+  const output = substitute(DEMO_TEMPLATE, placeholders, DEMO_VALUES, "bracket");
+  err.write(paint("demo: substituting [Party A], [Party B], [Effective Date]\n", "cyan", err));
+  out.write(output);
+  err.write(paint("\nthis is what a real run looks like. try:\n", "dim", err));
+  err.write(`  draft your-template.md --party-a "Acme" --party-b "Vendor" --effective-date 2026-06-01\n`);
+  return EXIT.OK;
+}
+
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 export async function main(argv, io = {}) {
   const out = io.out || process.stdout;
@@ -1029,6 +1068,7 @@ export async function main(argv, io = {}) {
 
   if (opts.help) { out.write(HELP_TEXT); return EXIT.OK; }
   if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
+  if (opts.demo) { return runDemo(out, err); }
 
   if (opts.positional.length === 0) {
     err.write(paint(`error: no template given\n`, "red", err));

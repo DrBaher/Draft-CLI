@@ -94,3 +94,12 @@ test("--help prints usage", async () => {
   assert.match(out, /USAGE/);
   assert.match(out, /DETECTION CASCADE/);
 });
+
+test("--demo writes a substituted draft to stdout (no file needed)", async () => {
+  const { code, out, err } = await runMain(main, ["--demo"]);
+  assert.equal(code, 0);
+  assert.match(out, /Acme Corporation/);
+  assert.match(out, /Vendor Inc\./);
+  assert.match(out, /2026-06-01/);
+  assert.match(err, /demo:/);
+});
