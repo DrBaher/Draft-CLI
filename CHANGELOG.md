@@ -39,6 +39,18 @@ suite ([cli.drbaher.com](https://cli.drbaher.com)).
   script to stdout. Completes top-level flags, the `--syntax` value
   (`bracket`/`mustache`), the `--completion` shell name, and file paths
   for `--params`/`--output`/`--dictionary`. No third-party generator.
+- **`--check-llm`** runs a one-token roundtrip against the configured LLM
+  provider — verifies env, auth, and reachability without sending any
+  template content. Exits `0` on success, `1` if no provider is configured,
+  `4` on provider error. Useful for CI / startup health checks in agent
+  pipelines.
+- **`--diff`** prints a per-placeholder substitution table to stdout and
+  exits — never writes output. With `--json`, emits a structured `diff`
+  array. Unresolved placeholders appear as `(unresolved)` / `to: null`
+  rather than erroring, so the caller can decide what to do.
+- **`-q` / `--silent`** suppresses all stderr (warnings, `--why` block,
+  notes, heuristic confirmations) for fully-quiet pipeline use. Argument-
+  parse errors still surface on the real stderr.
 - **Schema-rescue for T1/T2 detection.** Bracketed runs whose inner text
   matches a schema-declared alias are admitted by detection even when
   the heuristic rule would reject them. Lets all-caps signature-block

@@ -216,6 +216,8 @@ OPTIONS
   --yes-heuristic        substitute tier-4 matches without confirmation
   --no-llm               disable tier 5 even when env is configured
   --llm                  assert that env is configured (fail-fast if not)
+  --check-llm            one-token roundtrip to verify provider config
+  --diff                 show substitution table without writing output
   --dictionary PATH      override the bundled heuristic dictionary
   --<param-name> VALUE   set a parameter directly (kebab → snake_case)
   -h, --help             show full help

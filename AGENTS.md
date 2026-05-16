@@ -24,10 +24,13 @@ Drive `draft-cli` from an LLM agent or non-interactive client. Same shape as the
 ```sh
 draft --help                       # human-readable help
 draft --version                    # → draft-cli <semver>
+draft --check-llm                  # one-token roundtrip to verify env-configured LLM provider
 draft <template> --list-placeholders --json
                                    # placeholders the agent will need to supply, machine-readable
 draft <template> --validate --params deal.json
                                    # completeness check; exit 2 with `--json` `{ok:false, missing:[...]}` on failure
+draft <template> --diff --params deal.json --json
+                                   # structured diff (substitution table); never writes output
 ```
 
 Discovery flow for a fresh template:
@@ -73,6 +76,21 @@ On failure:
 ```json
 { "ok": false, "missing": ["party_b"] }
 ```
+
+### `--diff --json`
+
+```json
+{
+  "ok": true,
+  "tier": "bracket",
+  "diff": [
+    { "key": "party_a", "from": "[Party A]", "to": "Acme Corporation", "occurrences": 2 },
+    { "key": "effective_date", "from": "[Effective Date]", "to": null, "occurrences": 1 }
+  ]
+}
+```
+
+`to: null` means the placeholder is unresolved — `--diff` doesn't error on missing values; it shows them so the caller can decide.
 
 ### Main draft with `--json`
 

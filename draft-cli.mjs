@@ -86,12 +86,28 @@ const ANSI = {
   yellow: "\x1b[33m", cyan: "\x1b[36m", dim: "\x1b[2m", bold: "\x1b[1m",
 };
 
+/**
+ * Whether ANSI color should be emitted to `stream`. Honors the no-color.org
+ * convention: `NO_COLOR` (any value) → off, `FORCE_COLOR` (any value) → on,
+ * otherwise on iff `stream.isTTY`.
+ *
+ * @param {{isTTY?: boolean} | null | undefined} stream
+ * @returns {boolean}
+ */
 export function colorEnabled(stream) {
   if (process.env.NO_COLOR) return false;
   if (process.env.FORCE_COLOR) return true;
   return Boolean(stream && stream.isTTY);
 }
 
+/**
+ * Wrap `s` with an ANSI color code if {@link colorEnabled} for `stream`.
+ *
+ * @param {string} s
+ * @param {"red"|"green"|"yellow"|"cyan"|"dim"|"bold"} color
+ * @param {{isTTY?: boolean} | null | undefined} stream
+ * @returns {string}
+ */
 export function paint(s, color, stream) {
   return colorEnabled(stream) ? `${ANSI[color] || ""}${s}${ANSI.reset}` : String(s);
 }
@@ -119,6 +135,14 @@ export const DEFAULT_HEURISTIC_DICT = [
 ];
 
 // ─── .env READER (tiny inline parser) ───────────────────────────────────────
+/**
+ * Read a `.env` file. Tiny inline parser — handles `KEY=VALUE`, comments,
+ * blanks, and matched single/double quotes around values. Returns `{}` if
+ * the file doesn't exist.
+ *
+ * @param {string} path — usually `join(cwd, ".env")`.
+ * @returns {Object<string, string>}
+ */
 export function readDotenv(path) {
   if (!existsSync(path)) return {};
   const out = {};
@@ -138,11 +162,26 @@ export function readDotenv(path) {
   return out;
 }
 
+/**
+ * Merge `.env` file contents with the process environment. Process env
+ * always wins where both define a key.
+ *
+ * @param {string} [cwd]
+ * @param {Object<string, string>} [processEnv]
+ * @returns {Object<string, string>}
+ */
 export function effectiveEnv(cwd = process.cwd(), processEnv = process.env) {
   const fileEnv = readDotenv(join(cwd, ".env"));
   return { ...fileEnv, ...processEnv };
 }
 
+/**
+ * Pick an LLM provider configuration from a merged env object. Order:
+ * explicit `DRAFT_LLM_*` triple > `ANTHROPIC_API_KEY` > `OPENAI_API_KEY`.
+ *
+ * @param {Object<string, string>} envObj
+ * @returns {LlmProvider | null} null if no provider is configured.
+ */
 export function llmProviderFromEnv(envObj) {
   if (envObj.DRAFT_LLM_PROVIDER && envObj.DRAFT_LLM_API_KEY) {
     return {
@@ -177,8 +216,9 @@ const KNOWN_BOOLEAN = new Set([
   "--validate", "--list-placeholders",
   "--why", "--json", "--interactive", "-i",
   "--no-heuristic", "--yes-heuristic",
-  "--no-llm", "--llm",
+  "--no-llm", "--llm", "--check-llm",
   "--silent", "-q",
+  "--diff",
 ]);
 
 const KNOWN_VALUE = new Set([
@@ -209,6 +249,8 @@ export function parseArgs(argv) {
     demo: false,
     completion: null,
     silent: false,
+    checkLlm: false,
+    diff: false,
     noHeuristic: false,
     yesHeuristic: false,
     noLlm: false,
@@ -231,7 +273,9 @@ export function parseArgs(argv) {
     if (a === "--yes-heuristic") { opts.yesHeuristic = true; continue; }
     if (a === "--no-llm") { opts.noLlm = true; continue; }
     if (a === "--llm") { opts.forceLlm = true; continue; }
+    if (a === "--check-llm") { opts.checkLlm = true; continue; }
     if (a === "--silent" || a === "-q") { opts.silent = true; continue; }
+    if (a === "--diff") { opts.diff = true; continue; }
     if (a === "--params") { opts.params = argv[++i]; continue; }
     if (a === "--output" || a === "-o") { opts.output = argv[++i]; continue; }
     if (a === "--syntax") {
@@ -334,7 +378,9 @@ OPTIONS
   --no-heuristic        Disable tier 4.
   --yes-heuristic       Substitute tier-4 matches without confirmation.
   --no-llm              Disable tier 5 even when env is configured.
-  --llm                 Run tier 5 even if earlier tiers found placeholders.
+  --llm                 Assert env-configured LLM; fail-fast if not.
+  --check-llm           One-token roundtrip to the configured provider.
+  --diff                Show substitution table without writing output.
   --dictionary PATH     Override the bundled heuristic dictionary.
   --completion bash|zsh Emit a shell completion script to stdout.
   --<param-name> VALUE  Set a parameter directly. Kebab -> snake_case.
@@ -391,6 +437,10 @@ export async function resolveInput(arg, { spawner = spawnSync, stdinReader = rea
   return { kind: "text", body: readFileSync(arg, "utf8"), path: arg };
 }
 
+/**
+ * Read stdin to completion as a UTF-8 string.
+ * @returns {Promise<string>}
+ */
 export async function readStdin() {
   return await new Promise((res, rej) => {
     let s = "";
@@ -411,6 +461,15 @@ async function loadJSZip() {
   }
 }
 
+/**
+ * Open a `.docx`, return its extracted plain-text body and the raw XML
+ * (the XML is needed for tier-3 highlight detection).
+ *
+ * @param {string} path
+ * @returns {Promise<{ body: string, xml: string }>}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing jszip, invalid
+ *   `.docx`, or missing `word/document.xml`.
+ */
 export async function extractDocxText(path) {
   const JSZip = await loadJSZip();
   let zip;
@@ -433,6 +492,14 @@ export async function extractDocxText(path) {
 // Walk the XML in document order. For each <w:p> emit a line; concatenate
 // <w:t> contents within. Decode XML entities. Used for both output body and
 // T1/T2 detection on docx input.
+/**
+ * Walk Word's document XML in paragraph order and produce plain text.
+ * One line per `<w:p>`; text-run contents concatenated within. XML entities
+ * are decoded via {@link decodeXml}.
+ *
+ * @param {string} xml
+ * @returns {string}
+ */
 export function docxXmlToText(xml) {
   const paragraphs = xml.split(/<w:p[\s>]/i).slice(1);
   const lines = [];
@@ -447,6 +514,11 @@ export function docxXmlToText(xml) {
   return lines.join("\n");
 }
 
+/**
+ * Decode the five XML entities that appear in Word's `<w:t>` runs.
+ * @param {string} s
+ * @returns {string}
+ */
 export function decodeXml(s) {
   return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
           .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
@@ -455,6 +527,14 @@ export function decodeXml(s) {
 const RECOGNIZED_HIGHLIGHTS = new Set(["yellow", "green", "cyan", "magenta"]);
 
 // Scan the XML for highlighted runs. Returns an array of { text, color }.
+/**
+ * Find every highlighted text run in a Word document's XML. Unlike
+ * {@link detectDocxHighlight}, does NOT dedupe — multiple occurrences of
+ * the same highlighted text appear multiple times.
+ *
+ * @param {string} xml
+ * @returns {Array<{ text: string, color: string }>}
+ */
 export function extractDocxHighlights(xml) {
   const out = [];
   const runRe = /<w:r\b[\s\S]*?<\/w:r>/g;
@@ -481,6 +561,15 @@ const BRACKET_RE = /\[([^\[\]\n]{1,200})\](?!\()/g;
 const SECTION_REF_RE = /^\d+(?:\.\d+)*$/;
 const CHECKBOX_RE = /^[ xX]{1,3}$/;
 
+/**
+ * The locked T1 admission rule. Rejects markdown links, checkbox markers,
+ * pure section refs, punctuation-only runs, and all-uppercase headings.
+ * Permissive otherwise — accepts sentence-shaped placeholders with full
+ * punctuation, as real legal templates use.
+ *
+ * @param {string} inner — bracket contents (no `[` `]`).
+ * @returns {boolean}
+ */
 export function isBracketPlaceholder(inner) {
   if (!inner) return false;
   if (CHECKBOX_RE.test(inner)) return false;
@@ -520,6 +609,11 @@ export function detectBracket(body, schemaAliases = new Set()) {
 const MUSTACHE_RE = /\{\{\s*([^{}\n]{1,80}?)\s*\}\}/g;
 const SNAKE_RE = /^[a-z][a-z0-9_]{0,78}$/;
 
+/**
+ * T2 admission rule. Accepts snake_case or Title-Case inner text.
+ * @param {string} inner
+ * @returns {boolean}
+ */
 export function isMustachePlaceholder(inner) {
   if (SNAKE_RE.test(inner)) return true;
   return isBracketPlaceholder(inner);
@@ -546,6 +640,13 @@ export function detectMustache(body, schemaAliases = new Set()) {
   return out;
 }
 
+/**
+ * Whether `body` contains both bracket and mustache placeholders.
+ * Triggers the mixed-convention `--why`/stderr warning.
+ *
+ * @param {string} body
+ * @returns {boolean}
+ */
 export function hasBothConventions(body) {
   return detectBracket(body).length > 0 && detectMustache(body).length > 0;
 }
@@ -878,6 +979,13 @@ export async function runCascade(input, opts, schema, envObj, { fetcher } = {}) 
   return { tier: "none", placeholders: [], warnings, unmapped: [] };
 }
 
+/**
+ * Read a custom heuristic dictionary file. Must be a JSON array of strings.
+ *
+ * @param {string} path
+ * @returns {string[]}
+ * @throws {Error} with `.exitCode = EXIT.IO` on read or parse failure.
+ */
 export function readDictionary(path) {
   try {
     const j = JSON.parse(readFileSync(path, "utf8"));
@@ -934,6 +1042,13 @@ function resolveKey(hit, schema, fromLlm) {
 }
 
 // ─── VALUE RESOLUTION (CLI > JSON > prompt > default) ───────────────────────
+/**
+ * Read the JSON `--params` file. Returns `{}` if path is null.
+ *
+ * @param {string | null} path
+ * @returns {Object<string, *>}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing or invalid file.
+ */
 export function loadParamsFile(path) {
   if (!path) return {};
   if (!existsSync(path)) {
@@ -1066,6 +1181,24 @@ function replaceAll(s, find, repl) {
 }
 
 // ─── --why BUILDER ──────────────────────────────────────────────────────────
+/**
+ * Format the `--why` stderr block. Stable shape across minor versions; see
+ * the `tier`, `placeholders`, `resolved`, `defaulted`, `unresolved`,
+ * `unmapped`, and `warnings` keys.
+ *
+ * @param {{
+ *   inputDescriptor: string,
+ *   schemaDescriptor: string,
+ *   tier: Tier,
+ *   placeholders: Placeholder[],
+ *   sources: Object<string, string>,
+ *   missing: Placeholder[],
+ *   unmapped: Array<{phrase: string, tier: Tier}>,
+ *   warnings: string[],
+ *   outputPath: string | null,
+ * }} args
+ * @returns {string}
+ */
 export function buildWhyBlock({ inputDescriptor, schemaDescriptor, tier, placeholders, sources, missing, unmapped, warnings, outputPath }) {
   const counts = { cli: 0, params: 0, interactive: 0, default: 0 };
   for (const s of Object.values(sources)) counts[s] = (counts[s] || 0) + 1;
@@ -1213,6 +1346,25 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
     return EXIT.VALIDATION;
   }
 
+  // Diff mode: print a substitution table and exit without writing output.
+  if (opts.diff) {
+    if (opts.json) {
+      out.write(JSON.stringify({
+        ok: true,
+        tier: result.tier,
+        diff: result.placeholders.map((p) => ({
+          key: p.key,
+          from: `[${p.first_seen_as}]`,
+          to: resolved[p.key] !== undefined ? resolved[p.key] : null,
+          occurrences: p.occurrences,
+        })),
+      }, null, 2) + "\n");
+    } else {
+      out.write(buildDiffBlock(result.placeholders, resolved, { stream: out }));
+    }
+    return EXIT.OK;
+  }
+
   const output = substitute(input.body, result.placeholders, resolved, result.tier);
 
   // Write output.
@@ -1287,8 +1439,8 @@ async function confirmTty(prompt) {
 //   draft --completion zsh  > ~/.zsh/_draft     # zsh (then add to fpath)
 
 const BOOLEAN_FLAGS_FOR_COMPLETION = [
-  "--help", "--version", "--demo",
-  "--validate", "--list-placeholders",
+  "--help", "--version", "--demo", "--check-llm",
+  "--validate", "--list-placeholders", "--diff",
   "--why", "--json", "--silent", "--interactive",
   "--no-heuristic", "--yes-heuristic",
   "--no-llm", "--llm",
@@ -1383,6 +1535,8 @@ _draft() {
     '--yes-heuristic[substitute tier-4 matches without confirmation]'
     '--no-llm[disable tier 5 even when env is configured]'
     '--llm[assert env-configured LLM, fail-fast if missing]'
+    '--check-llm[one-token roundtrip to verify provider config]'
+    '--diff[show substitution table without writing output]'
     '--params[JSON params file]:params file:_files -g "*.json"'
     '--output[output path]:output:_files'
     '-o[output path]:output:_files'
@@ -1396,6 +1550,76 @@ _draft() {
 
 _draft "$@"
 `;
+}
+
+// ─── DOCTOR: --check-llm ────────────────────────────────────────────────────
+/**
+ * One-token roundtrip to the configured LLM provider. Confirms env, auth,
+ * and provider reachability without sending any template content. Useful in
+ * CI / startup health checks for agent-driven pipelines.
+ *
+ * Returns EXIT.OK on success, EXIT.LLM on provider error, EXIT.IO if no
+ * provider is configured.
+ *
+ * @param {Object<string, string>} envObj
+ * @param {NodeJS.WritableStream} out
+ * @param {NodeJS.WritableStream} err
+ * @param {{ fetcher?: typeof fetch }} [io]
+ * @returns {Promise<number>}
+ */
+export async function runCheckLlm(envObj, out, err, { fetcher } = {}) {
+  const provider = llmProviderFromEnv(envObj);
+  if (!provider) {
+    err.write(paint("error: no LLM provider configured in .env or process env.\n", "red", err));
+    err.write(`hint: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or the DRAFT_LLM_* triple.\n`);
+    return EXIT.IO;
+  }
+  err.write(paint(`checking ${provider.provider} (${provider.model || "default model"})…\n`, "cyan", err));
+  try {
+    const hits = await detectLlm("ping", provider, { fetcher });
+    // Regardless of what detectLlm returns, getting through the parse step
+    // without throwing means: auth ok, transport ok, response parseable.
+    out.write(`ok: ${provider.provider} reachable, ${provider.model || "default model"}\n`);
+    return EXIT.OK;
+  } catch (e) {
+    err.write(paint(`error: ${e.message}\n`, "red", err));
+    return e.exitCode || EXIT.LLM;
+  }
+}
+
+// ─── DIFF MODE ──────────────────────────────────────────────────────────────
+/**
+ * Build a per-placeholder substitution table for `--diff` mode. One line per
+ * placeholder showing what would change, plus a summary footer.
+ *
+ * @param {Placeholder[]} placeholders
+ * @param {Object<string, string>} resolved
+ * @param {{stream?: {isTTY?: boolean}}} [io]
+ * @returns {string}
+ */
+export function buildDiffBlock(placeholders, resolved, { stream } = {}) {
+  if (placeholders.length === 0) return "no changes (no placeholders detected).\n";
+  const maxFrom = Math.max(...placeholders.map((p) => `[${p.first_seen_as}]`.length));
+  const lines = [];
+  let totalSubstitutions = 0;
+  let unresolvedCount = 0;
+  for (const p of placeholders) {
+    const from = `[${p.first_seen_as}]`.padEnd(maxFrom);
+    const to = resolved[p.key];
+    if (to === undefined) {
+      lines.push(`  ${paint(from, "red", stream)}  →  ${paint("(unresolved)", "red", stream)}` +
+                 (p.occurrences > 1 ? `   ×${p.occurrences}` : ""));
+      unresolvedCount += 1;
+    } else {
+      lines.push(`  ${paint(from, "yellow", stream)}  →  ${paint(to, "green", stream)}` +
+                 (p.occurrences > 1 ? `   ×${p.occurrences}` : ""));
+      totalSubstitutions += p.occurrences;
+    }
+  }
+  lines.unshift("changes that would be made:");
+  lines.push("");
+  lines.push(`${placeholders.length} placeholder(s), ${totalSubstitutions} substitution(s), ${unresolvedCount} unresolved.`);
+  return lines.join("\n") + "\n";
 }
 
 // ─── DEMO (bundled fixture for the 30-second first run) ────────────────────
@@ -1480,6 +1704,10 @@ export async function main(argv, io = {}) {
   if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
   if (opts.completion) { out.write(completionScript(opts.completion)); return EXIT.OK; }
   if (opts.demo) { return runDemo(out, err); }
+  if (opts.checkLlm) {
+    const envObj = effectiveEnv(cwd, processEnv);
+    return await runCheckLlm(envObj, out, err, { fetcher });
+  }
 
   if (opts.positional.length === 0) {
     err.write(paint(`error: no template given\n`, "red", err));
