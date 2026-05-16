@@ -1,0 +1,6 @@
+{
+  "_meta": { "schema_version": 1 },
+  "party_a":        { "aliases": ["Party A"], "required": true },
+  "party_b":        { "aliases": ["Party B"], "required": true },
+  "effective_date": { "aliases": ["Effective Date"], "required": false, "default": "the date first written above" }
+}

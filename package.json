@@ -1,0 +1,49 @@
+{
+  "name": "draft-cli",
+  "version": "0.1.0",
+  "description": "Fill placeholders in a legal-document template with parameter values. Part of the contract-operations suite.",
+  "type": "module",
+  "bin": {
+    "draft": "./draft-cli.mjs"
+  },
+  "main": "./draft-cli.mjs",
+  "exports": {
+    ".": "./draft-cli.mjs"
+  },
+  "files": [
+    "draft-cli.mjs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/test_*.mjs",
+    "test:quick": "node --test tests/test_t1_bracket.mjs tests/test_schema.mjs tests/test_substitution.mjs",
+    "coverage": "node --test --experimental-test-coverage tests/test_*.mjs",
+    "smoke": "npm pack && npm install -g $(ls -1t *.tgz | head -n1) && draft --version && draft --help | head -n 5"
+  },
+  "keywords": [
+    "legal",
+    "contracts",
+    "templates",
+    "nda",
+    "placeholder",
+    "cli"
+  ],
+  "author": "DrBaher",
+  "license": "MIT",
+  "homepage": "https://github.com/DrBaher/draft-cli",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DrBaher/draft-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DrBaher/draft-cli/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}
