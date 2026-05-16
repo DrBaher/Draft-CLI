@@ -58,5 +58,13 @@ jobs:
         run: |
           tarball=$(ls -1t ./*.tgz | head -n1)
           npm install -g "$tarball"
-      - run: draft --version
-      - run: draft --demo
+      - name: assert the bin actually runs (regression guard for 0.1.0)
+        run: |
+          out=$(draft --version)
+          echo "version output: $out"
+          [[ "$out" == draft-cli* ]] || { echo "::error::draft --version produced unexpected output: '$out'"; exit 1; }
+          demo=$(draft --demo)
+          echo "demo first line: $(echo "$demo" | head -n1)"
+          # --demo writes the substituted template to stdout (and the "demo: substituting..." line to stderr).
+          # Grep for the substituted Party A value to prove the substitution actually ran end-to-end.
+          echo "$demo" | grep -q "Acme Corporation" || { echo "::error::draft --demo stdout did not contain substituted [Party A]"; exit 1; }
