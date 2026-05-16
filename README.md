@@ -289,6 +289,7 @@ will join the suite when it ships.
 ## Documentation
 
 - [GETTING_STARTED.md](GETTING_STARTED.md) — 10-minute walk-through of every flow.
+- [AGENTS.md](AGENTS.md) — JSON shapes, exit codes, library use; everything an LLM agent driving `draft-cli` needs.
 - [PARAM_SCHEMA.md](PARAM_SCHEMA.md) — locked v1 contract: cascade, schema file, precedence.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — single-file rationale, substitution model, .docx parsing.
 - [FAQ.md](FAQ.md) — design questions and trade-offs.
