@@ -228,7 +228,23 @@ Tier 1 (bracket) tries first against the extracted text. If the
 yellow / green / cyan / magenta highlighted runs as placeholders.
 Output is plain markdown; `.docx` output round-trip is a v2 feature.
 
-## 10. Compose with the rest of the suite
+## 10. Tab completion (optional)
+
+```sh
+# bash
+draft --completion bash >> ~/.bashrc
+
+# zsh
+draft --completion zsh > ~/.zsh/completions/_draft
+```
+
+After reloading your shell, tab-completion fills in flags, the
+`--syntax bracket|mustache` argument, and file paths for `--params`,
+`--output`, and `--dictionary`. The dynamic `--<param-name>` flags
+aren't completed (they depend on the template), but every static flag
+is.
+
+## 11. Compose with the rest of the suite
 
 ```sh
 template-vault get nda/house-mutual \

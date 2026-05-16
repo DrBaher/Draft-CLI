@@ -54,6 +54,20 @@ npx draft-cli@latest --demo
 
 Requires Node.js ≥ 18. Tested on Ubuntu and macOS, Node 18 / 20 / 22.
 
+### Shell completion
+
+```sh
+# bash
+draft --completion bash >> ~/.bashrc
+
+# zsh
+draft --completion zsh > ~/.zsh/completions/_draft
+# ensure ~/.zsh/completions is in fpath, then: autoload -U compinit && compinit
+```
+
+Completes flags, the `--syntax bracket|mustache` value, `--completion bash|zsh`,
+and file paths for `--params`, `--output`, and `--dictionary`.
+
 ---
 
 ## 30-second first run

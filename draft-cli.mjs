@@ -115,7 +115,7 @@ const KNOWN_BOOLEAN = new Set([
 ]);
 
 const KNOWN_VALUE = new Set([
-  "--params", "--output", "-o", "--syntax", "--dictionary",
+  "--params", "--output", "-o", "--syntax", "--dictionary", "--completion",
 ]);
 
 export function parseArgs(argv) {
@@ -131,6 +131,7 @@ export function parseArgs(argv) {
     why: false,
     json: false,
     demo: false,
+    completion: null,
     noHeuristic: false,
     yesHeuristic: false,
     noLlm: false,
@@ -164,6 +165,14 @@ export function parseArgs(argv) {
       continue;
     }
     if (a === "--dictionary") { opts.dictionary = argv[++i]; continue; }
+    if (a === "--completion") {
+      const v = argv[++i];
+      if (v !== "bash" && v !== "zsh") {
+        throw new UsageError(`--completion must be 'bash' or 'zsh' (got '${v}')`);
+      }
+      opts.completion = v;
+      continue;
+    }
     if (a.startsWith("--")) {
       // Unknown --x — treat as param flag with the next token as value.
       const key = kebabToSnake(a.slice(2));
@@ -211,6 +220,7 @@ USAGE
   draft --list-placeholders <template> [--json]
   draft --validate <template> --params FILE
   draft --demo              (bundled demo, no file needed)
+  draft --completion bash   (emit shell completion script)
 
 DETECTION CASCADE  (sequential-with-stop; first non-empty tier wins)
   1. bracket        [Title Case]              deterministic, default on
@@ -236,6 +246,7 @@ OPTIONS
   --no-llm              Disable tier 5 even when env is configured.
   --llm                 Run tier 5 even if earlier tiers found placeholders.
   --dictionary PATH     Override the bundled heuristic dictionary.
+  --completion bash|zsh Emit a shell completion script to stdout.
   --<param-name> VALUE  Set a parameter directly. Kebab -> snake_case.
   -h, --help            Show this help.
   -V, --version         Show version.
@@ -1056,6 +1067,114 @@ async function confirmTty(prompt) {
   });
 }
 
+// ─── COMPLETION ─────────────────────────────────────────────────────────────
+// Hand-rolled bash/zsh completion. No third-party generator. Install with:
+//   draft --completion bash >> ~/.bashrc        # bash
+//   draft --completion zsh  > ~/.zsh/_draft     # zsh (then add to fpath)
+
+const BOOLEAN_FLAGS_FOR_COMPLETION = [
+  "--help", "--version", "--demo",
+  "--validate", "--list-placeholders",
+  "--why", "--json", "--interactive",
+  "--no-heuristic", "--yes-heuristic",
+  "--no-llm", "--llm",
+];
+
+const VALUE_FLAGS_FOR_COMPLETION = [
+  "--params", "--output", "--syntax", "--dictionary", "--completion",
+];
+
+export function completionScript(shell) {
+  if (shell === "bash") return bashCompletion();
+  if (shell === "zsh") return zshCompletion();
+  const e = new Error(`unsupported shell for completion: ${shell}`);
+  e.exitCode = EXIT.IO;
+  throw e;
+}
+
+function bashCompletion() {
+  const allFlags = [...BOOLEAN_FLAGS_FOR_COMPLETION, ...VALUE_FLAGS_FOR_COMPLETION].join(" ");
+  return `# bash completion for draft-cli — install with:
+#   draft --completion bash >> ~/.bashrc
+# or, for a single session:
+#   eval "$(draft --completion bash)"
+
+_draft_completion() {
+  local cur prev
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  case "$prev" in
+    --syntax)
+      COMPREPLY=( $(compgen -W "bracket mustache" -- "$cur") )
+      return 0
+      ;;
+    --completion)
+      COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+      return 0
+      ;;
+    --params|--dictionary)
+      COMPREPLY=( $(compgen -f -X '!*.json' -- "$cur") $(compgen -d -- "$cur") )
+      return 0
+      ;;
+    --output|-o)
+      COMPREPLY=( $(compgen -f -- "$cur") )
+      return 0
+      ;;
+  esac
+  if [[ "$cur" == --* ]]; then
+    COMPREPLY=( $(compgen -W "${allFlags}" -- "$cur") )
+  elif [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "-h -V -i -o ${allFlags}" -- "$cur") )
+  else
+    COMPREPLY=( $(compgen -f -- "$cur") )
+  fi
+  return 0
+}
+complete -F _draft_completion draft
+`;
+}
+
+function zshCompletion() {
+  return `#compdef draft
+# zsh completion for draft-cli — install with:
+#   draft --completion zsh > ~/.zsh/completions/_draft
+# and ensure ~/.zsh/completions is in fpath:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -U compinit && compinit
+
+_draft() {
+  local -a flags
+  flags=(
+    '--help[show help]'
+    '-h[show help]'
+    '--version[show version]'
+    '-V[show version]'
+    '--demo[bundled demo, no file needed]'
+    '--validate[completeness check, never writes output]'
+    '--list-placeholders[enumerate placeholders and exit]'
+    '--why[structured explanation to stderr]'
+    '--json[machine-readable output on stdout]'
+    '--interactive[prompt for missing required params]'
+    '-i[prompt for missing required params]'
+    '--no-heuristic[disable tier 4]'
+    '--yes-heuristic[substitute tier-4 matches without confirmation]'
+    '--no-llm[disable tier 5 even when env is configured]'
+    '--llm[assert env-configured LLM, fail-fast if missing]'
+    '--params[JSON params file]:params file:_files -g "*.json"'
+    '--output[output path]:output:_files'
+    '-o[output path]:output:_files'
+    '--syntax[placeholder convention]:syntax:(bracket mustache)'
+    '--dictionary[heuristic dictionary override]:dict:_files -g "*.json"'
+    '--completion[emit shell completion script]:shell:(bash zsh)'
+    '*:template:_files'
+  )
+  _arguments -s -S $flags
+}
+
+_draft "$@"
+`;
+}
+
 // ─── DEMO (bundled fixture for the 30-second first run) ────────────────────
 export const DEMO_TEMPLATE = `# Mutual Non-Disclosure Agreement (demo)
 
@@ -1112,6 +1231,7 @@ export async function main(argv, io = {}) {
 
   if (opts.help) { out.write(HELP_TEXT); return EXIT.OK; }
   if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
+  if (opts.completion) { out.write(completionScript(opts.completion)); return EXIT.OK; }
   if (opts.demo) { return runDemo(out, err); }
 
   if (opts.positional.length === 0) {

@@ -35,6 +35,19 @@ suite ([cli.drbaher.com](https://cli.drbaher.com)).
   `template-vault get` integration for `<category>/<name>[@version]` refs.
 - **ANSI color** honors `NO_COLOR` and `FORCE_COLOR`; auto-disables off-TTY.
 - **`--demo`** flag for a zero-file 30-second first run (`npx draft-cli@latest --demo`).
+- **`--completion bash|zsh`** flag that emits a hand-rolled shell completion
+  script to stdout. Completes top-level flags, the `--syntax` value
+  (`bracket`/`mustache`), the `--completion` shell name, and file paths
+  for `--params`/`--output`/`--dictionary`. No third-party generator.
+- **Schema-rescue for T1/T2 detection.** Bracketed runs whose inner text
+  matches a schema-declared alias are admitted by detection even when
+  the heuristic rule would reject them. Lets all-caps signature-block
+  markers (`[COMPANY]`) and fill-in markers (`[_____________]`) be
+  brought into the alias map without loosening the heuristic itself.
+- **Typo guard** on `--<param-name>` flags. Unused flags are surfaced
+  as warnings and named in the missing-required error, so a typo'd
+  `--party-bb` doesn't silently fall through to a "missing party_b"
+  error with no connection.
 - **Exit codes**: `0` ok, `1` i/o, `2` validation, `3` template-vault failure,
   `4` LLM failure.
 - **GitHub Actions CI**: Ubuntu × macOS × Node 18 / 20 / 22 test matrix,
