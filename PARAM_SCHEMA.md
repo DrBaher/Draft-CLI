@@ -1,218 +1,305 @@
-# PARAM_SCHEMA — proposal (v1)
+# PARAM_SCHEMA — v1 contract (locked)
 
-Locking the parameter contract before code. One page. Reviewer: DrBaher.
+This doc is the source of truth for how `draft-cli` discovers placeholders,
+maps them to parameters, validates inputs, and reports results. Locked
+after Q1–Q4 and D1–D4 review. Reviewer: DrBaher.
 
 ---
 
-## 1. Placeholder syntax
+## 1. Stack & posture
 
-**Primary:** `[Title Case Bracketed]` — Common Paper, YC SAFE, Bonterms.
-**Opt-in:** `--syntax mustache` switches matching to `{{Title Case}}` (or
-`{{snake_case}}` — both accepted inside mustache).
+- **Runtime:** Node.js ≥ 18 (global `fetch`, `node:test`, `--env-file`-style behavior re-implemented inline so we don't require ≥ 20.6).
+- **Distribution:** `npm install -g draft-cli`, single-file `draft-cli.mjs` shebang executable.
+- **Runtime dependencies (v1):** exactly one — `jszip` (MIT, zero transitive) for `.docx` unzip. Everything else uses Node's stdlib. LLM tier uses global `fetch` directly; no SDK dep.
+- **Local-first.** No telemetry. The only network call is the optional LLM tier and only when explicitly configured (see §3 T5).
+
+## 2. Inputs and outputs
+
+```
+draft <template> [flags]
+draft - [flags]                  # template body from stdin
+draft <cat>/<name>[@ver] ...     # pulls via `template-vault get`
+```
+
+- **Input forms accepted:** `path/to/file.md`, `path/to/file.txt`, `path/to/file.docx`, stdin (`-`), or a `template-vault` ref shaped `<category>/<name>[@version]`. Vault refs shell out to `template-vault get` — no library import.
+- **Output:** stdout by default, `--output PATH` for files. Output is always plain text/markdown in v1 — `.docx` is **input-only** for v1. Writing `.docx` back is deferred to v2.
+- **Encoding:** UTF-8 in, UTF-8 out. No BOM written; BOM tolerated on read.
+
+## 3. Detection cascade (sequential-with-stop)
+
+The cascade runs each tier in order. The first tier that returns **≥ 1 placeholder** wins and the others are skipped. The active tier is reported in `--why` and in `--json` output.
+
+| Tier | Name           | Deterministic | Default | Trigger to skip                  |
+| ---- | -------------- | ------------- | ------- | -------------------------------- |
+| T1   | Bracket        | ✅            | on      | `--syntax mustache` selected     |
+| T2   | Mustache       | ✅            | opt-in  | not selected via `--syntax`      |
+| T3   | DOCX highlight | ✅            | auto    | input not `.docx`                |
+| T4   | Heuristic      | ✅            | on      | `--no-heuristic`                 |
+| T5   | LLM            | ❌            | env-gated | no LLM provider configured     |
+
+### T1 — Bracket `[Title Case]`
 
 A bracketed run is treated as a placeholder when **all** of:
 
-1. Starts with `[`, ends with `]`, no nested brackets.
-2. Inner text matches `^[A-Z][A-Za-z0-9 ]{0,78}[A-Za-z0-9]$` (length 2–80,
-   starts uppercase, ends letter/digit, only letters/digits/spaces inside).
-3. Inner text is **not** entirely uppercase (excludes headings like
-   `[CONFIDENTIALITY]`, `[ARTICLE I]`).
-4. First character of the inner text is a letter (excludes `[3.1]`,
-   `[4.a]`, etc.).
+1. `[...]`, no nested brackets.
+2. Inner text matches `^[A-Z][A-Za-z0-9 ]{0,78}[A-Za-z0-9]$` (length 2–80).
+3. Inner text is **not** entirely uppercase (excludes `[CONFIDENTIALITY]`).
+4. First character is a letter (excludes `[3.1]`).
 
-Examples that **match**: `[Party A]`, `[Party A Name]`, `[Effective Date]`,
-`[State of California]`, `[Term]`, `[Disclosing Party]`.
-Examples that **don't**: `[3.1]`, `[ARTICLE I]`, `[CONFIDENTIALITY]`,
-`[See Section 4]` *(actually this would match — see open question Q3)*.
+Examples that match: `[Party A]`, `[Effective Date]`, `[State of California]`.
+Examples that don't: `[3.1]`, `[ARTICLE I]`, `[CONFIDENTIALITY]`.
+
+Cross-references like `[See Section 4]` *do* match T1 by design. The
+**schema file** (§5) is the disambiguation tool: when present, only declared
+keys substitute and other bracketed runs are left untouched.
+
+### T2 — Mustache `{{...}}`
+
+Opt-in via `--syntax mustache`. Matches `{{<inner>}}` where `<inner>` is
+either Title Case (same rule as T1 inner) or snake_case `[a-z][a-z0-9_]{0,78}`.
 
 Mixed-convention templates (both `[X]` and `{{X}}` present) emit a
-`doctor`-style warning on stderr but do not error. The active `--syntax`
-wins; the other family's matches are left untouched in the output.
+`doctor`-style stderr warning. The selected `--syntax` family is the only
+one substituted; the other is left untouched in output.
 
-## 2. Key conventions
+### T3 — DOCX highlight
+
+Triggered only when input is `.docx`. Unzip with `jszip`, read
+`word/document.xml`, regex-scan for highlight runs:
+
+```xml
+<w:r>
+  <w:rPr><w:highlight w:val="yellow"/></w:rPr>
+  <w:t>Acme Corporation</w:t>
+</w:r>
+```
+
+Highlight colors recognized as placeholders: `yellow`, `green`, `cyan`,
+`magenta` (Word's "highlight as TODO" colors). Black/white/auto highlights
+are ignored.
+
+The captured text becomes the bracket-equivalent. So `Acme Corporation`
+in a yellow highlight is treated identically to `[Acme Corporation]` from
+T1 — same canonical-key derivation, same alias machinery.
+
+Output for .docx input is plain markdown: the text is extracted in
+document order (one paragraph per `<w:p>`), highlights are replaced, and
+the result is written to stdout or `--output`. Round-trip to `.docx`
+is **v2**.
+
+### T4 — Generic-name heuristic
+
+A bundled dictionary (`config/heuristic.json` shipped in the wheel) lists
+known generic placeholder values: `Acme Corporation`, `Acme Inc`,
+`Foo Corp`, `John Doe`, `Jane Roe`, `123 Main Street`, `example@example.com`,
+`555-555-1234`, `MM/DD/YYYY`, `TBD`, `[INSERT ___]`, etc. Curated, not
+inferred.
+
+Matches against the **untemplated body** (after T1–T3 ran and found
+nothing). Case-sensitive whole-word matching.
+
+**Safety gate (D3 locked):** T4 matches **never substitute silently**.
+Behavior:
+
+- In a TTY without `--yes-heuristic`: print each match, prompt `y/N`.
+- In a non-TTY without `--yes-heuristic`: print a warning block and
+  **leave matches untouched**. Substitution requires explicit opt-in.
+- With `--yes-heuristic`: substitute non-interactively (the user
+  has taken ownership).
+- `--no-heuristic` disables T4 entirely.
+
+Dictionary override: `--dictionary PATH` replaces (not extends) the bundled list.
+
+### T5 — LLM (last resort, env-gated)
+
+Runs only when **both** are true:
+- T1–T4 produced zero placeholders.
+- A provider is configured via env (read from `.env` in the working
+  directory or process env — process env wins).
+
+Provider env vars (any one suffices):
+- `ANTHROPIC_API_KEY` → Anthropic Messages API (default model: claude-sonnet-4-6).
+- `OPENAI_API_KEY` → OpenAI Responses API (default model: gpt-4o-mini).
+- `DRAFT_LLM_PROVIDER` + `DRAFT_LLM_API_KEY` (+ optional `DRAFT_LLM_MODEL`) → explicit override.
+
+If no provider env is present, the cascade **stops at T4** and the CLI
+errors with a clear message: `no placeholders detected by deterministic
+tiers; set ANTHROPIC_API_KEY (or equivalent) in .env to enable LLM
+detection, or pass --syntax mustache if your template uses {{...}}.`
+
+The LLM call sends template text **only**, no params file, no user data.
+Prompt asks for a JSON array of placeholder spans with `start`, `end`,
+`suggested_key`. Result is validated against the same canonical-key
+rules; invalid entries are dropped with a warning.
+
+`--no-llm` forces the cascade to stop at T4 even when env is configured.
+`--llm` forces T5 to run even when T1–T4 found matches (useful for
+discovering missed generics in a bracketed template).
+
+## 4. Key conventions
 
 Three surfaces, one canonical key per parameter.
 
-| Surface       | Form                  | Example         |
-| ------------- | --------------------- | --------------- |
-| Bracket text  | Title Case w/ spaces  | `[Party A Name]` |
-| Canonical key | snake_case            | `party_a_name`  |
+| Surface       | Form                  | Example          |
+| ------------- | --------------------- | ---------------- |
+| Match source  | Title Case w/ spaces  | `Party A Name`   |
+| Canonical key | snake_case            | `party_a_name`   |
 | CLI flag      | kebab-case            | `--party-a-name` |
 | JSON file key | snake_case            | `"party_a_name"` |
 
-**Derivation** (when no schema file is present): bracket text → lowercase
-→ spaces become underscores. `[Party A Name]` → `party_a_name`.
-Reverse direction is informational only — we never re-render a key as
-bracket text in output; the original bracket text from the template is
-preserved exactly (case, spacing) and replaced byte-for-byte.
+Derivation when no schema is present: match text → lowercase, spaces → underscores. `Party A Name` → `party_a_name`. The original match text is preserved in output (case/spacing intact); we replace byte-for-byte.
 
-Disallowed in placeholders (will error with a clear message if found in
-a `<template>.params.json`): dots, slashes, leading digits, hyphens
-inside the bracket text. Reserved key names: `_meta`, `_aliases`,
-`_required`, `_defaults` (the schema container reserves these for its
-own keys; see §3).
+Disallowed in placeholders (will error if found in a schema file): dots, slashes, leading digits, hyphens inside the match text. Reserved schema-file keys: `_meta`, `_aliases`, `_required`, `_defaults`.
 
-## 3. Schema file: `<template>.params.json`
+## 5. Schema file: `<template>.params.json`
 
-Sibling file, opt-in. If absent, placeholders are **inferred** from the
-template by the rule in §1, every inferred placeholder is treated as
-required, and CLI/JSON keys are auto-derived.
+Sibling file, opt-in. If absent, placeholders are inferred by the active
+cascade tier; every inferred placeholder is treated as required; keys are
+auto-derived.
 
 If present, the schema is **authoritative**: only declared parameters
-are substituted, anything else bracketed is left in place (with a
-`doctor` warning naming the orphans).
+substitute. Anything else the cascade detects is left untouched and
+listed in `--why` as `unmapped`.
 
-**Short form** (matches the example DrBaher gave in the brief):
+### Short form (default in docs)
 
 ```json
 {
-  "party_a": ["Party A", "Party A Name", "Disclosing Party"],
+  "party_a": ["Party A", "Disclosing Party"],
   "party_b": ["Party B", "Receiving Party"],
   "effective_date": ["Effective Date"]
 }
 ```
 
-Each value is a list of bracketed phrase forms (without the `[` `]`)
-that all map to the canonical key. The canonical key is **not**
-implicitly added to its own alias list — list it explicitly if you want
-`[party_a]` to match.
+Each value is a list of phrase forms (bracket inner text, mustache inner
+text, or highlighted text). The canonical key is **NOT** implicitly in
+its own alias list (Q3 locked) — list it explicitly if needed.
 
-**Long form** (when you need `required: false` or a default):
+### Long form (with `_meta`)
 
 ```json
 {
   "_meta": { "schema_version": 1 },
-  "party_a":        { "aliases": ["Party A", "Disclosing Party"], "required": true },
-  "party_b":        { "aliases": ["Party B"], "required": true },
+  "party_a":        { "aliases": ["Party A"], "required": true },
   "effective_date": { "aliases": ["Effective Date"], "required": false, "default": "the date first written above" }
 }
 ```
 
-The two forms are mutually exclusive within a file — short OR long, not
-mixed. A `_meta` key at the top level switches the parser into long
-form; otherwise it's short form.
+Parser selects long form iff a top-level `_meta` key is present. Short
+and long are not mixable within one file.
 
-## 4. Precedence
+### Orphan handling (Q4 locked)
 
-Per the brief: **CLI flags > JSON params file > interactive prompt >
-schema default > error**.
+Schema declares a key whose alias list matches no detected phrase →
+**error**, exit 2. Catches drift early.
 
-- CLI flag present → wins, even if the value is the empty string.
-- JSON file value present → wins over the prompt and schema default.
-- `--interactive` set AND value still missing → prompt for it.
-- Schema declares a `default` AND value still missing → use the default.
-- Still missing → error (see §5), exit 2.
+## 6. Precedence
 
-## 5. Validation & errors
+CLI flag > JSON `--params` file > `--interactive` prompt > schema `default` > error.
 
-**`draft --validate <template> --params FILE`** runs the same lookup
-but never writes output. Exits 0 if every required placeholder is
-resolved, 2 otherwise.
+- CLI flag present (even `""`) wins.
+- JSON value present wins over prompt and default.
+- `--interactive` set AND still missing → prompt.
+- Schema `default` present AND still missing → use the default.
+- Still missing → error, exit 2.
 
-**`draft --list-placeholders <template>`** prints every detected
-placeholder, deduplicated, in order of first appearance. With `--json`,
-emits:
+## 7. Validation, modes, errors
+
+### `draft --validate <template> --params FILE`
+
+Same lookup, never writes output. Exits 0 if every required key resolves;
+2 otherwise. Honors all five cascade tiers and the schema if present.
+
+### `draft --list-placeholders <template>`
+
+Prints detected placeholders in first-appearance order, deduplicated.
+With `--json`:
 
 ```json
 {
   "template": "nda/house-mutual",
-  "syntax": "bracket",
+  "tier": "bracket",
   "placeholders": [
-    {"key": "party_a", "first_seen_as": "Party A", "aliases": ["Party A", "Disclosing Party"], "required": true, "occurrences": 4},
-    {"key": "party_b", "first_seen_as": "Party B", "aliases": ["Party B"], "required": true, "occurrences": 4}
-  ]
+    { "key": "party_a", "first_seen_as": "Party A",
+      "aliases": ["Party A", "Disclosing Party"],
+      "required": true, "occurrences": 4, "tier": "bracket" }
+  ],
+  "warnings": []
 }
 ```
 
-**Error shapes** (stderr, colorized red when TTY):
+### Error shapes (stderr, red on TTY, honors `NO_COLOR`/`FORCE_COLOR`)
 
 ```
 error: missing required parameter(s):
-  - party_a   ([Party A], [Disclosing Party])  — supply via --party-a or "party_a" in --params
-  - effective_date ([Effective Date])          — supply via --effective-date or "effective_date" in --params
+  - party_a   (matched: [Party A], [Disclosing Party])
+      supply --party-a or set "party_a" in --params
+  - effective_date (matched: [Effective Date])
+      supply --effective-date or set "effective_date" in --params
 hint: run `draft --list-placeholders nda/house-mutual` to see all parameters.
 ```
 
 ```
-error: mixed placeholder conventions in template (found 4 bracket, 2 mustache).
-note: pass --syntax bracket or --syntax mustache to choose; the other family is left untouched.
+error: mixed placeholder conventions in template (4 bracket, 2 mustache).
+note: pass --syntax bracket or --syntax mustache; the other family is left untouched.
 ```
 
 ```
-error: schema file nda/house-mutual.params.json declares "party_c" but no bracketed phrase
-       in the template matches its alias list ["Party C", "Third Party"].
+error: schema declares "party_c" with aliases ["Party C","Third Party"],
+       but no matching phrase was detected by tier 'bracket'.
 hint: remove the entry from the schema, or add the phrase to the template.
 ```
 
+```
+error: no placeholders detected by deterministic tiers (bracket, mustache,
+       docx-highlight, heuristic).
+hint: set ANTHROPIC_API_KEY in .env to enable LLM detection,
+      or pass --syntax mustache if your template uses {{...}}.
+```
+
 Exit codes: `0` success, `1` template/input I/O error, `2` validation
-failure (missing/unknown params, mixed syntax without `--syntax`,
-schema-template mismatch), `3` template-vault subprocess failure.
+failure, `3` template-vault subprocess failure, `4` LLM tier failure
+(network, auth, malformed response).
 
-## 6. `--why` shape
+## 8. `--why` output
 
-Structured stderr block (or stdout if `--json`), shown when `--why` is set:
+Structured stderr block (or stdout under `--json`):
 
 ```
 draft: substituted 7 placeholders in nda/house-mutual → draft.md
 why:
-  syntax        = bracket
-  schema        = nda/house-mutual.params.json (long form)
+  input         = nda/house-mutual (via template-vault get)
+  tier          = bracket
+  schema        = nda/house-mutual.params.json (short form)
   placeholders  = 4 distinct, 12 occurrences
-  resolved      = 4 (3 from CLI, 1 from --params)
+  resolved      = 4 (3 from CLI, 1 from --params, 0 interactive, 0 default)
   defaulted     = 0
   unresolved    = 0
+  unmapped      = 1 ([See Section 4] — not in schema)
   warnings      = 0
 ```
 
-## 7. Out of scope for v1 (deferred to v2; called out so the schema is
-   forward-compatible)
+## 9. Out of scope for v1 (deferred — schema is forward-compatible)
 
-- Computed placeholders (`[Effective Date + 2 years]`). Schema reserves
-  a future `"computed"` key on long-form entries.
-- Typed parameters (`party`, `date`, `money`). Schema reserves a future
-  `"type"` key.
-- Cross-template parameter registry (`parties.json`). Additive — would
-  layer underneath the JSON params file in precedence.
+- Computed placeholders (`[Effective Date + 2 years]`). Long-form schema reserves a future `"computed"` key.
+- Typed parameters (`party`, `date`, `money`). Reserves a future `"type"` key.
+- Cross-template parameter registry (`parties.json`). Additive; would layer underneath `--params` in precedence.
+- `.docx` output round-trip.
+- LLM-assisted suggestion *from a deal description* (current T5 only suggests from template text).
 
 ---
 
-## Open questions for review (please decide before code)
+## Locked decisions (audit trail)
 
-**Q1 — cross-reference false positives.** `[See Section 4]` passes
-the §1 rule today and would be treated as a parameter. Three options:
+| ID  | Question                                | Decision |
+| --- | --------------------------------------- | -------- |
+| Q1  | Cross-references like [See Section 4]   | Subsumed: schema file disambiguates; T4/T5 expand coverage. |
+| Q2  | Short-form vs long-form schema          | Both supported; `_meta` selects long form. |
+| Q3  | Canonical key implicit-alias            | No — explicit list only. |
+| Q4  | Orphan schema declarations              | Error, exit 2. |
+| D1  | Cascade semantics                       | Sequential-with-stop. |
+| D2  | LLM default behavior                    | Env-gated auto-fallback at T4 boundary. |
+| D3  | Heuristic safety gate                   | Warn-only, requires `--yes-heuristic` or interactive confirm. |
+| D4  | .docx parsing                           | `jszip` + regex on `word/document.xml`. |
 
-- (a) **Accept it as a parameter.** If users don't supply
-  `see_section_4`, validation fails loudly and they fix the template
-  (the user's own legal text shouldn't read `[See Section 4]` anyway —
-  they'd write `See Section 4` without brackets). Simplest rule, no
-  special cases. ← **my recommendation**
-- (b) Add a stoplist of leading words (`See`, `See also`, `As`,
-  `Per`) that disqualify a bracketed run.
-- (c) Require a schema file when the template has any bracketed
-  Title-Case strings, no inference path. Safest but heaviest UX.
-
-**Q2 — short-form vs long-form schema, pick one or keep both?** I
-proposed both above. Both is friendly but doubles the parser surface
-and the test matrix. Pick:
-
-- (a) **Keep both, short-form is the default in docs.** ← my rec
-- (b) Long-form only. Simpler implementation, slightly more verbose
-  schema files.
-- (c) Short-form only; ship long-form features (`required:false`,
-  defaults) in v2.
-
-**Q3 — does the canonical key match itself implicitly?** If schema
-says `{"party_a": ["Party A"]}`, should the literal `[party_a]`
-(bracketed snake_case) in the template also resolve? I proposed
-**no** (explicit list wins). Alternative: **yes**, always add the
-canonical key to the implicit alias set.
-
-**Q4 — orphan handling.** When the schema declares a parameter but
-no bracketed phrase matches, is that:
-
-- (a) An **error** (exit 2). ← my rec — catches schema drift early.
-- (b) A **warning** — substitute nothing, leave the user a note.
-
----
-
-*End of proposal. No code written yet. Awaiting review.*
+*End of contract. Code begins once approved.*
