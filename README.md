@@ -272,6 +272,16 @@ will join the suite when it ships.
 
 ---
 
+## Documentation
+
+- [GETTING_STARTED.md](GETTING_STARTED.md) — 10-minute walk-through of every flow.
+- [PARAM_SCHEMA.md](PARAM_SCHEMA.md) — locked v1 contract: cascade, schema file, precedence.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — single-file rationale, substitution model, .docx parsing.
+- [FAQ.md](FAQ.md) — design questions and trade-offs.
+- [SECURITY.md](SECURITY.md) — threat model and how to report a vulnerability.
+- [CHANGELOG.md](CHANGELOG.md) — release notes and the v2 "Deferred" list.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — scope rules and release flow.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
