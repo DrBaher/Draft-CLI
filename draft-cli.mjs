@@ -70,7 +70,7 @@ import { fileURLToPath } from "node:url";
  */
 
 /** @type {string} */
-export const VERSION = "0.1.1";
+export const VERSION = "0.2.0";
 
 // ─── EXIT CODES ─────────────────────────────────────────────────────────────
 /**
@@ -489,6 +489,43 @@ export async function extractDocxText(path) {
   return { body: docxXmlToText(xml), xml };
 }
 
+/**
+ * Re-read the original `.docx`, swap in a new `word/document.xml`, and
+ * return the resulting `.docx` as a `Buffer`. All other parts of the
+ * package (`[Content_Types].xml`, relationships, images, headers, etc.)
+ * pass through unchanged.
+ *
+ * @param {string} originalPath — filesystem path to the source `.docx`.
+ * @param {string} newDocumentXml — replacement content for `word/document.xml`.
+ * @returns {Promise<Buffer>}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing jszip or invalid source.
+ */
+export async function writeDocxBuffer(originalPath, newDocumentXml) {
+  const JSZip = await loadJSZip();
+  let zip;
+  try { zip = await JSZip.loadAsync(readFileSync(originalPath)); }
+  catch (err) {
+    const e = new Error(`could not re-open source .docx (${err.message})`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  zip.file("word/document.xml", newDocumentXml);
+  return await zip.generateAsync({ type: "nodebuffer" });
+}
+
+/**
+ * Derive the default `.docx` output filename from an input path. Appends
+ * `-filled` before the extension: `contract.docx` → `contract-filled.docx`.
+ * If the input has no extension, appends `-filled.docx`.
+ * @param {string} inputPath
+ * @returns {string}
+ */
+export function makeDocxOutputPath(inputPath) {
+  const ext = extname(inputPath);
+  if (!ext) return `${inputPath}-filled.docx`;
+  return `${inputPath.slice(0, -ext.length)}-filled${ext}`;
+}
+
 // Walk the XML in document order. For each <w:p> emit a line; concatenate
 // <w:t> contents within. Decode XML entities. Used for both output body and
 // T1/T2 detection on docx input.
@@ -522,6 +559,18 @@ export function docxXmlToText(xml) {
 export function decodeXml(s) {
   return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
           .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+/**
+ * Inverse of {@link decodeXml}. Used when writing substituted text back into
+ * a Word document's `<w:t>` runs. Only encodes the three structural
+ * characters; double- and single-quotes don't need encoding inside element
+ * text content.
+ * @param {string} s
+ * @returns {string}
+ */
+export function encodeXml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 const RECOGNIZED_HIGHLIGHTS = new Set(["yellow", "green", "cyan", "magenta"]);
@@ -1180,6 +1229,83 @@ function replaceAll(s, find, repl) {
   return s.split(find).join(repl);
 }
 
+/**
+ * Substitute placeholder values *inside the Word XML*, preserving runs
+ * and styling. Returns a new XML string plus warnings for any placeholder
+ * whose text spans multiple `<w:t>` runs in the source — these are
+ * skipped rather than substituted (merging the runs would lose styling
+ * information; leaving them is reversible).
+ *
+ * For T1 (bracket) / T2 (mustache) the search text is the literal match
+ * (e.g. `[Party A]` or `{{party_a}}`). For T3 (docx-highlight), T4
+ * (heuristic), T5 (llm) the search text is the run's inner content with
+ * whole-word boundaries — same semantics as {@link substitute}.
+ *
+ * @param {string} xml — original `word/document.xml`.
+ * @param {Placeholder[]} placeholders
+ * @param {Object<string,string>} values — `{ key: resolvedValue }`.
+ * @param {Tier} tier
+ * @returns {{ xml: string, warnings: string[] }}
+ */
+export function substituteDocxXml(xml, placeholders, values, tier) {
+  let out = xml;
+  const warnings = [];
+  const originalText = docxXmlToText(xml);
+  for (const p of placeholders) {
+    const v = values[p.key];
+    if (v === undefined) continue;
+    for (const h of p.hits) {
+      const find = (tier === "bracket" || tier === "mustache") ? h.match : h.inner;
+      const literal = (tier === "bracket" || tier === "mustache");
+      const buildRe = (global) => literal
+        ? new RegExp(escapeRegex(find), global ? "g" : "")
+        : new RegExp(`(?<![A-Za-z0-9])${escapeRegex(find)}(?![A-Za-z0-9])`, global ? "g" : "");
+      const replaceRe = buildRe(true);
+      let madeSubstitution = false;
+      out = out.replace(/<w:t(\s[^>]*)?>([\s\S]*?)<\/w:t>/g, (match, attrs, content) => {
+        const decoded = decodeXml(content);
+        replaceRe.lastIndex = 0;
+        const replaced = decoded.replace(replaceRe, v);
+        if (replaced === decoded) return match;
+        madeSubstitution = true;
+        return `<w:t${attrs || ""}>${encodeXml(replaced)}</w:t>`;
+      });
+      if (!madeSubstitution && buildRe(false).test(originalText)) {
+        warnings.push(
+          `docx substitution skipped for "${find}" (→ "${v}"): the placeholder spans ` +
+          `multiple text runs in the source, which would lose run-level styling if merged. ` +
+          `Open the document, retype the placeholder so it lives in a single run, and retry.`
+        );
+      }
+    }
+  }
+  return { xml: out, warnings };
+}
+
+/**
+ * Decide whether to write `.docx` output (round-trip) versus plain text.
+ * Returns `{ path }` for `.docx`, or `null` for text. Rules:
+ *   - input must be `.docx`;
+ *   - `--json`, `--diff`, `--validate`, `--list-placeholders` force text;
+ *   - `--output PATH.docx` writes `.docx` to PATH;
+ *   - `--output -` writes plain text to stdout (Unix `-` convention);
+ *   - `--output PATH` with any other extension writes plain text;
+ *   - no `--output` defaults to `<basename>-filled.docx`.
+ *
+ * @param {Object} opts — parsed CLI args.
+ * @param {{kind: "text"|"docx", path: string|null}} input
+ * @returns {{ path: string } | null}
+ */
+export function decideDocxOutput(opts, input) {
+  if (input.kind !== "docx") return null;
+  if (opts.json || opts.diff || opts.listPlaceholders || opts.validate) return null;
+  if (opts.output === "-") return null;
+  if (opts.output) {
+    return extname(opts.output) === ".docx" ? { path: opts.output } : null;
+  }
+  return { path: makeDocxOutputPath(input.path || "out.docx") };
+}
+
 // ─── --why BUILDER ──────────────────────────────────────────────────────────
 /**
  * Format the `--why` stderr block. Stable shape across minor versions; see
@@ -1367,9 +1493,29 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
 
   const output = substitute(input.body, result.placeholders, resolved, result.tier);
 
-  // Write output.
-  if (opts.output) {
-    try { writeFileSync(opts.output, output, "utf8"); }
+  // Write output. Three paths:
+  //   (a) docx round-trip: input is .docx and target is .docx (default for .docx
+  //       inputs, unless --output is set to a non-.docx extension or `-`).
+  //   (b) write text to a file (--output PATH, where PATH ≠ "-").
+  //   (c) write text to stdout (no --output, or --output "-").
+  // --json suppresses (c) so it doesn't collide with the JSON payload.
+  const docxOut = decideDocxOutput(opts, input);
+  let writtenPath = null;
+  if (docxOut) {
+    try {
+      const { xml: newXml, warnings: docxWarnings } = substituteDocxXml(
+        input.docxXml, result.placeholders, resolved, result.tier
+      );
+      if (docxWarnings.length) result.warnings.push(...docxWarnings);
+      const buf = await writeDocxBuffer(input.path, newXml);
+      writeFileSync(docxOut.path, buf);
+      writtenPath = docxOut.path;
+    } catch (e) {
+      err.write(paint(`error: could not write ${docxOut.path}: ${e.message}\n`, "red", err));
+      return EXIT.IO;
+    }
+  } else if (opts.output && opts.output !== "-") {
+    try { writeFileSync(opts.output, output, "utf8"); writtenPath = opts.output; }
     catch (e) {
       err.write(paint(`error: could not write ${opts.output}: ${e.message}\n`, "red", err));
       return EXIT.IO;
@@ -1382,8 +1528,8 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
     out.write(JSON.stringify({
       ok: true,
       tier: result.tier,
-      output_path: opts.output || null,
-      output: opts.output ? null : output,
+      output_path: writtenPath,
+      output: writtenPath ? null : output,
       placeholders: publicPlaceholders(result.placeholders),
       sources,
       warnings: result.warnings,
@@ -1401,7 +1547,7 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
       missing,
       unmapped: result.unmapped,
       warnings: result.warnings,
-      outputPath: opts.output,
+      outputPath: writtenPath,
     }) + "\n");
   }
   for (const w of result.warnings) err.write(paint(`warning: ${w}\n`, "yellow", err));

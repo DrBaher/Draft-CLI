@@ -22,7 +22,20 @@ draft <cat>/<name>[@ver] ...     # pulls via `template-vault get`
 ```
 
 - **Input forms accepted:** `path/to/file.md`, `path/to/file.txt`, `path/to/file.docx`, stdin (`-`), or a `template-vault` ref shaped `<category>/<name>[@version]`. Vault refs shell out to `template-vault get` — no library import.
-- **Output:** stdout by default, `--output PATH` for files. Output is always plain text/markdown in v1 — `.docx` is **input-only** for v1. Writing `.docx` back is deferred to v2.
+- **Output:** depends on input kind and `--output` target.
+
+  | Input        | `--output`          | Output                                |
+  | ------------ | ------------------- | ------------------------------------- |
+  | text (any)   | absent              | plain text on stdout                  |
+  | text (any)   | `-`                 | plain text on stdout                  |
+  | text (any)   | `PATH` (any ext)    | plain text written to `PATH`          |
+  | `.docx`      | absent              | `.docx` to `<basename>-filled.docx`   |
+  | `.docx`      | `PATH.docx`         | `.docx` to `PATH.docx`                |
+  | `.docx`      | `-`                 | plain text (substituted body) on stdout |
+  | `.docx`      | `PATH` (non-`.docx`)| plain text written to `PATH`          |
+
+  `.docx` output is a round-trip: the original `.docx` package is reopened, the substituted text is written back into the same `<w:t>` runs that detection found, and all other parts of the package (relationships, images, headers, `[Content_Types].xml`, etc.) pass through unchanged. Run-level styling is preserved. If a placeholder's text spans multiple `<w:t>` runs in the source (Word sometimes splits runs at punctuation or auto-correct boundaries), that placeholder is **skipped**, not substituted, and a warning is emitted explaining how to fix the source — locked decision Q1.1.
+- `--json`, `--diff`, `--validate`, and `--list-placeholders` all override the `.docx` round-trip and produce text/JSON to stdout (or to `--output PATH`, when provided).
 - **Encoding:** UTF-8 in, UTF-8 out. No BOM written; BOM tolerated on read.
 
 ## 3. Detection cascade (sequential-with-stop)

@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file. The
 format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to semantic versioning once it leaves 0.x.
 
+## 0.2.0 — 2026-05-16
+
+### Added
+
+- **`.docx` output round-trip.** Templates read from `.docx` (tier 3
+  highlight detection) now write back as `.docx`, preserving runs,
+  styles, paragraph breaks, and every non-document part of the package
+  (`[Content_Types].xml`, relationships, images, headers, etc.).
+  Default output filename is `<basename>-filled.docx` next to the
+  input; override with `--output PATH.docx`. Schema-rescue, T1/T2
+  bracket/mustache detection, and T4/T5 substitution all benefit
+  too — any tier that detects a placeholder in a `.docx` template
+  now substitutes back into the same runs.
+- **`--output -` writes plain text to stdout** (Unix `-` convention).
+  Use this on a `.docx` input to get the substituted body as text
+  instead of a `.docx` file: `draft contract.docx --output -`.
+- **`writeDocxBuffer(originalPath, newDocumentXml)`**, **`makeDocxOutputPath(inputPath)`**,
+  **`substituteDocxXml(xml, placeholders, values, tier)`**, **`decideDocxOutput(opts, input)`**,
+  and **`encodeXml(s)`** added to the public API for programmatic
+  drivers. Same import surface as `substitute` and `extractDocxText`.
+
+### Changed
+
+- **Default output for `.docx` input is now `<basename>-filled.docx`,
+  not stdout text.** Previously, `draft contract.docx` (no
+  `--output`) extracted text and wrote substituted plain text to
+  stdout. v0.2.0 writes `contract-filled.docx` next to the input.
+  Pipelines that depended on the stdout-text behavior should pass
+  `--output -` to opt back in.
+
+### Split-run handling
+
+When a placeholder's text spans multiple `<w:t>` runs in the source
+`.docx` (Word sometimes splits runs at punctuation, auto-correct
+boundaries, or comment anchors), v0.2.0 emits a warning and skips
+that substitution rather than merging the runs and losing run-level
+styling. The warning explains how to fix the source: open the
+document, retype the placeholder so it lives in one run, save, and
+retry. This decision is logged in `PARAM_SCHEMA.md` §2.
+
 ## 0.1.1 — 2026-05-16
 
 ### Fixed
