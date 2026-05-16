@@ -7,6 +7,7 @@ Drive `draft-cli` from an LLM agent or non-interactive client. Same shape as the
 - **Success**: substituted document body to **stdout** (or to `--output PATH` if given), exit `0`. With `--json`, **stdout** is a single JSON object instead.
 - **Failure**: human-readable error to **stderr**, non-zero exit. With `--json`, **stdout** is `{ok: false, missing: [...]}` or similar; the error message still goes to stderr.
 - Diagnostic text (`--why` block, warnings, `note:` lines, color) always goes to **stderr**. Stdout is reserved for the substituted document or the JSON report. This separation is the contract — pipelines can safely compose `template-vault get … | draft - | nda-review …` without stderr poisoning.
+- `--silent` (`-q`) suppresses stderr completely after argument parsing. Use this for fully-quiet pipelines where you only want the stdout artifact.
 
 ## Exit codes
 

@@ -26,7 +26,8 @@ install:
 	npm install -g .
 
 smoke: build
-	npm install -g $$(ls -1t draft-cli-*.tgz | head -n1)
+	version=$$(node -p "require('./package.json').version"); \
+	  npm install -g "./draft-cli-$${version}.tgz"
 	draft --version
 	draft --demo > /dev/null
 	@echo "smoke ok"

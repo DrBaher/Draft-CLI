@@ -103,3 +103,32 @@ test("--demo writes a substituted draft to stdout (no file needed)", async () =>
   assert.match(out, /2026-06-01/);
   assert.match(err, /demo:/);
 });
+
+test("--silent suppresses stderr (--why block, warnings, notes)", async () => {
+  const args = [
+    "tests/fixtures/bracket-template.md", "--why",
+    "--party-a", "Acme", "--party-b", "Vendor",
+    "--effective-date", "2026-06-01", "--state-of-california", "Delaware",
+  ];
+  const normal = await runMain(main, args);
+  const silent = await runMain(main, [...args, "--silent"]);
+  assert.equal(silent.code, 0);
+  // stdout (substituted draft) is unchanged.
+  assert.equal(silent.out, normal.out);
+  // stderr (why block) is empty.
+  assert.equal(silent.err, "");
+  // Without --silent, the why block is on stderr.
+  assert.match(normal.err, /why:/);
+});
+
+test("--silent shorthand -q works", async () => {
+  const args = [
+    "tests/fixtures/bracket-template.md", "--why",
+    "--party-a", "Acme", "--party-b", "Vendor",
+    "--effective-date", "2026-06-01", "--state-of-california", "Delaware",
+    "-q",
+  ];
+  const { code, err } = await runMain(main, args);
+  assert.equal(code, 0);
+  assert.equal(err, "");
+});

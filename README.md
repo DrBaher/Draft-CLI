@@ -211,6 +211,7 @@ OPTIONS
   -i, --interactive      prompt for missing required parameters
   --why                  structured explanation to stderr
   --json                 machine-readable result on stdout
+  -q, --silent           suppress all stderr (warnings, --why, notes)
   --no-heuristic         disable tier 4
   --yes-heuristic        substitute tier-4 matches without confirmation
   --no-llm               disable tier 5 even when env is configured

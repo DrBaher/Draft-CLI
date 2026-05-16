@@ -9,10 +9,76 @@ import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
+/**
+ * @typedef {"bracket"|"mustache"|"docx-highlight"|"heuristic"|"llm"|"none"} Tier
+ *
+ * @typedef {Object} DetectionHit
+ *   A single raw detection from one of the cascade tiers.
+ * @property {string} match — the full matched span (e.g. "[Party A]").
+ * @property {string} inner — the text inside the delimiters (e.g. "Party A").
+ * @property {number} [index] — byte offset into the body, if known.
+ * @property {string} [suggested_key] — only on T5/LLM hits.
+ * @property {string} [color] — only on T3/docx-highlight hits.
+ *
+ * @typedef {Object} Placeholder
+ *   An assembled placeholder — one canonical key, all its hits, schema metadata.
+ * @property {string} key — canonical snake_case identifier.
+ * @property {string} first_seen_as — the inner text of the first hit.
+ * @property {number} occurrences — number of hits for this key.
+ * @property {Tier} tier — which cascade tier produced this.
+ * @property {boolean} required — whether the user MUST supply a value.
+ * @property {string|null} default — schema-supplied fallback, or null.
+ * @property {string[]} aliases — phrase forms that map to this key.
+ * @property {DetectionHit[]} hits — every detection for this key.
+ *
+ * @typedef {Object} SchemaEntry
+ * @property {string[]} aliases — phrase forms accepted for this key.
+ * @property {boolean} required
+ * @property {string|null} default
+ *
+ * @typedef {Object} Schema
+ * @property {"short"|"long"} form
+ * @property {Object<string, SchemaEntry>} entries
+ * @property {string} [sourcePath] — file the schema was loaded from, if any.
+ *
+ * @typedef {Object} ParsedArgs
+ *   Result of parseArgs(argv). See parseArgs() for shape.
+ *
+ * @typedef {Object} CascadeResult
+ * @property {Tier} tier
+ * @property {Placeholder[]} placeholders
+ * @property {string[]} warnings
+ * @property {Array<{phrase: string, tier: Tier}>} unmapped
+ * @property {boolean} [heuristicGate] — true iff tier='heuristic' and
+ *   substitution requires explicit confirmation.
+ *
+ * @typedef {Object} ResolvedValues
+ * @property {Object<string, string>} resolved — key -> value.
+ * @property {Placeholder[]} missing — unresolved required placeholders.
+ * @property {Object<string, "cli"|"params"|"interactive"|"default">} sources
+ *
+ * @typedef {Object} Input
+ * @property {"text"|"docx"} kind
+ * @property {string} body — the template text (extracted for docx).
+ * @property {string|null} path — filesystem path, or null for stdin/vault.
+ * @property {string} [docxXml] — raw word/document.xml for docx inputs.
+ *
+ * @typedef {Object} LlmProvider
+ * @property {string} provider — "anthropic" | "openai" | custom.
+ * @property {string} apiKey
+ * @property {string|null} model
+ */
+
+/** @type {string} */
 export const VERSION = "0.1.0";
 
 // ─── EXIT CODES ─────────────────────────────────────────────────────────────
-export const EXIT = { OK: 0, IO: 1, VALIDATION: 2, VAULT: 3, LLM: 4 };
+/**
+ * Stable exit codes. Documented in AGENTS.md and never re-numbered without
+ * a major-version bump.
+ * @type {Readonly<{OK: 0, IO: 1, VALIDATION: 2, VAULT: 3, LLM: 4}>}
+ */
+export const EXIT = Object.freeze({ OK: 0, IO: 1, VALIDATION: 2, VAULT: 3, LLM: 4 });
 
 // ─── COLOR (honors NO_COLOR / FORCE_COLOR) ──────────────────────────────────
 const ANSI = {
@@ -112,12 +178,22 @@ const KNOWN_BOOLEAN = new Set([
   "--why", "--json", "--interactive", "-i",
   "--no-heuristic", "--yes-heuristic",
   "--no-llm", "--llm",
+  "--silent", "-q",
 ]);
 
 const KNOWN_VALUE = new Set([
   "--params", "--output", "-o", "--syntax", "--dictionary", "--completion",
 ]);
 
+/**
+ * Parse argv into a structured options object. Two-phase: known flags are
+ * recognized explicitly; everything else of the form `--xxx VALUE` is
+ * collected into `paramFlags` (canonical_key → value).
+ *
+ * @param {string[]} argv — typically `process.argv.slice(2)`.
+ * @returns {ParsedArgs}
+ * @throws {UsageError} on invalid `--syntax`, `--completion`, missing values.
+ */
 export function parseArgs(argv) {
   const opts = {
     positional: [],
@@ -132,6 +208,7 @@ export function parseArgs(argv) {
     json: false,
     demo: false,
     completion: null,
+    silent: false,
     noHeuristic: false,
     yesHeuristic: false,
     noLlm: false,
@@ -154,6 +231,7 @@ export function parseArgs(argv) {
     if (a === "--yes-heuristic") { opts.yesHeuristic = true; continue; }
     if (a === "--no-llm") { opts.noLlm = true; continue; }
     if (a === "--llm") { opts.forceLlm = true; continue; }
+    if (a === "--silent" || a === "-q") { opts.silent = true; continue; }
     if (a === "--params") { opts.params = argv[++i]; continue; }
     if (a === "--output" || a === "-o") { opts.output = argv[++i]; continue; }
     if (a === "--syntax") {
@@ -192,8 +270,18 @@ export class UsageError extends Error {
 }
 
 // ─── KEY DERIVATION ─────────────────────────────────────────────────────────
+/** @param {string} s @returns {string} kebab-case → snake_case. */
 export function kebabToSnake(s) { return s.replace(/-/g, "_"); }
 
+/**
+ * Derive a canonical snake_case key from arbitrary placeholder text.
+ * Permissive: non-alphanumerics collapse to `_`, leading-digit inputs get
+ * an `_` prefix, length capped at 60. Always produces a valid snake_case
+ * key for any non-empty input that contains at least one alphanumeric.
+ *
+ * @param {string} matchText — e.g. "Party A Name", "Today's date", "1 year(s)".
+ * @returns {string} e.g. "party_a_name", "today_s_date", "_1_year_s".
+ */
 export function canonicalKey(matchText) {
   // Permissive slug: lowercase, non-alphanum runs become single "_",
   // strip leading/trailing "_", prefix "_" if leading char is a digit.
@@ -207,6 +295,7 @@ export function canonicalKey(matchText) {
 }
 
 const VALID_KEY_RE = /^[a-z_][a-z0-9_]*$/;
+/** @param {string} key @returns {boolean} */
 export function validKey(key) { return VALID_KEY_RE.test(key); }
 
 // ─── HELP ───────────────────────────────────────────────────────────────────
@@ -241,6 +330,7 @@ OPTIONS
   --list-placeholders   Enumerate placeholders and exit.
   --why                 Print a structured explanation to stderr.
   --json                Emit JSON to stdout (suppresses human messages).
+  -q, --silent          Suppress all stderr output (warnings, --why, notes).
   --no-heuristic        Disable tier 4.
   --yes-heuristic       Substitute tier-4 matches without confirmation.
   --no-llm              Disable tier 5 even when env is configured.
@@ -261,6 +351,18 @@ Part of the contract-operations suite. See cli.drbaher.com.
 // Returns { kind: "text"|"docx", body: string, docxXml?: string, path: string|null }
 const VAULT_REF_RE = /^[a-z][a-z0-9-]*\/[a-z0-9-]+(?:@[A-Za-z0-9._-]+)?$/;
 
+/**
+ * Resolve a positional template argument into a usable {@link Input}.
+ * Handles three forms: stdin (`-`), a `template-vault get` ref
+ * (`<category>/<name>[@version]`), or a filesystem path (text or `.docx`).
+ *
+ * @param {string} arg
+ * @param {{ spawner?: typeof spawnSync, stdinReader?: () => Promise<string> }} [opts]
+ *   Injectable spawn / stdin reader for tests.
+ * @returns {Promise<Input>}
+ * @throws {Error} with `.exitCode` set to one of {@link EXIT}'s values on
+ *   I/O failure (1), vault subprocess failure (3), or `.docx` parse failure (1).
+ */
 export async function resolveInput(arg, { spawner = spawnSync, stdinReader = readStdin } = {}) {
   if (arg === "-") {
     return { kind: "text", body: await stdinReader(), path: null };
@@ -390,10 +492,18 @@ export function isBracketPlaceholder(inner) {
   return true;
 }
 
-// Returns array of { match: "[Party A]", inner: "Party A", index }.
-// schemaAliases (optional) is a Set of phrase strings; bracketed runs whose
-// inner matches a schema alias are admitted even if the heuristic rule would
-// reject them (lets schema rescue [COMPANY], [_____________], etc.).
+/**
+ * Tier 1 detection: bracketed `[...]` placeholders.
+ *
+ * `schemaAliases` (optional) is a Set of phrase strings declared in the
+ * schema file; bracketed runs whose inner matches a schema alias are
+ * admitted even if the heuristic rule {@link isBracketPlaceholder} would
+ * reject them (lets a schema rescue `[COMPANY]`, `[_____________]`, etc.).
+ *
+ * @param {string} body
+ * @param {Set<string>} [schemaAliases]
+ * @returns {DetectionHit[]}
+ */
 export function detectBracket(body, schemaAliases = new Set()) {
   const out = [];
   let m;
@@ -415,6 +525,14 @@ export function isMustachePlaceholder(inner) {
   return isBracketPlaceholder(inner);
 }
 
+/**
+ * Tier 2 detection: `{{Title Case}}` or `{{snake_case}}` mustache placeholders.
+ * Only invoked when `--syntax mustache` is selected. Schema-rescue same as T1.
+ *
+ * @param {string} body
+ * @param {Set<string>} [schemaAliases]
+ * @returns {DetectionHit[]}
+ */
 export function detectMustache(body, schemaAliases = new Set()) {
   const out = [];
   let m;
@@ -433,7 +551,14 @@ export function hasBothConventions(body) {
 }
 
 // ─── TIER 3: DOCX HIGHLIGHT ─────────────────────────────────────────────────
-// Returns { match: text, inner: text, color } per unique highlighted phrase.
+/**
+ * Tier 3 detection: scan a Word document's XML for highlighted text runs.
+ * Recognizes yellow / green / cyan / magenta highlights as placeholders;
+ * other colors are ignored. Dedupes by exact text match.
+ *
+ * @param {string} xml — content of `word/document.xml`.
+ * @returns {DetectionHit[]}
+ */
 export function detectDocxHighlight(xml) {
   if (!xml) return [];
   const hits = extractDocxHighlights(xml);
@@ -447,6 +572,18 @@ export function detectDocxHighlight(xml) {
 // ─── TIER 4: HEURISTIC ──────────────────────────────────────────────────────
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
+/**
+ * Tier 4 detection: scan body for known generic-placeholder phrases from a
+ * curated dictionary. Whole-word matching only. Returns one entry per
+ * phrase that appears (dedupe by phrase).
+ *
+ * Note: substitute() does a global regex replace on T4 hits, so a single
+ * detection may correspond to multiple substitutions in the output.
+ *
+ * @param {string} body
+ * @param {string[]} [dict] — phrases to look for. Defaults to {@link DEFAULT_HEURISTIC_DICT}.
+ * @returns {DetectionHit[]}
+ */
 export function detectHeuristic(body, dict = DEFAULT_HEURISTIC_DICT) {
   const out = [];
   const seen = new Set();
@@ -465,6 +602,21 @@ export function detectHeuristic(body, dict = DEFAULT_HEURISTIC_DICT) {
 }
 
 // ─── TIER 5: LLM ────────────────────────────────────────────────────────────
+/**
+ * Tier 5 detection: ask an LLM to suggest placeholders in the body.
+ *
+ * Sends template text ONLY. Does not include params, schema, or env. The
+ * provider's response is parsed as `{ placeholders: [{text, suggested_key}] }`;
+ * malformed entries are dropped silently. Tests inject a `fetcher` so they
+ * never make real network calls.
+ *
+ * @param {string} body
+ * @param {LlmProvider} providerCfg
+ * @param {{ fetcher?: typeof fetch | null }} [opts]
+ * @returns {Promise<DetectionHit[]>}
+ * @throws {Error} with `.exitCode = EXIT.LLM` on auth, transport, or
+ *   parse failure.
+ */
 export async function detectLlm(body, providerCfg, { fetcher = (typeof fetch !== "undefined" ? fetch : null) } = {}) {
   if (!fetcher) {
     const e = new Error("fetch is not available; Node 18+ is required for the LLM tier");
@@ -557,6 +709,13 @@ async function safeText(r) { try { return await r.text(); } catch { return ""; }
 // ─── SCHEMA LOADING ─────────────────────────────────────────────────────────
 // Returns { form: "short"|"long", entries: { [key]: { aliases, required, default } } }
 // or null if no schema file exists.
+/**
+ * Look for a sibling `<template>.params.json` and parse it.
+ *
+ * @param {string|null} templatePath — pass null for stdin / vault input.
+ * @returns {Schema|null} Parsed schema (with `.sourcePath` set) or null if no file.
+ * @throws {Error} with `.exitCode = EXIT.IO` on malformed JSON or invalid structure.
+ */
 export function loadSchema(templatePath) {
   if (!templatePath) return null;
   const candidate = templatePath.replace(/\.[^./]+$/, "") + ".params.json";
@@ -575,6 +734,15 @@ export function loadSchema(templatePath) {
   return out;
 }
 
+/**
+ * Validate and normalize a parsed JSON schema object. Auto-selects short vs
+ * long form based on the presence of a top-level `_meta` key.
+ *
+ * @param {Object} parsed — JSON.parse output of the schema file.
+ * @param {string} [sourceLabel] — used in error messages.
+ * @returns {Schema}
+ * @throws {Error} with `.exitCode = EXIT.IO` on invalid structure.
+ */
 export function parseSchema(parsed, sourceLabel = "<schema>") {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     const e = new Error(`${sourceLabel}: top-level must be an object`);
@@ -621,6 +789,21 @@ export function parseSchema(parsed, sourceLabel = "<schema>") {
 //   warnings: string[],
 //   unmapped: [{ phrase, tier }],
 // }
+/**
+ * Run the five-tier sequential-with-stop detection cascade on an input.
+ * The first tier to return ≥1 hit wins; subsequent tiers are skipped.
+ * Always emits a mixed-convention warning when both `[...]` and `{{...}}`
+ * appear in the body, regardless of which tier wins.
+ *
+ * @param {Input} input
+ * @param {ParsedArgs} opts
+ * @param {Schema|null} schema
+ * @param {Object<string, string>} envObj — merged file + process env.
+ * @param {{ fetcher?: typeof fetch }} [io] — for LLM tier mocking.
+ * @returns {Promise<CascadeResult>}
+ * @throws {Error} with `.exitCode = EXIT.LLM` if `--llm` was set but no
+ *   provider is configured.
+ */
 export async function runCascade(input, opts, schema, envObj, { fetcher } = {}) {
   const warnings = [];
   const body = input.body;
@@ -774,6 +957,17 @@ export function loadParamsFile(path) {
   }
 }
 
+/**
+ * Resolve a value for every placeholder using the locked precedence chain:
+ * CLI flag > `--params` JSON > `--interactive` prompt > schema default >
+ * (missing). Empty-string CLI values are considered supplied (not missing).
+ *
+ * @param {Placeholder[]} placeholders
+ * @param {ParsedArgs} opts
+ * @param {Object<string, *>} paramsObj — parsed JSON params file.
+ * @param {{ prompter?: (p: Placeholder) => Promise<string|null> }} [io]
+ * @returns {Promise<ResolvedValues>}
+ */
 export async function resolveValues(placeholders, opts, paramsObj, { prompter = nodePrompter } = {}) {
   const resolved = {};
   const missing = [];
@@ -818,6 +1012,14 @@ async function nodePrompter(placeholder) {
 }
 
 // Schema declares params not present in the template → orphan error.
+/**
+ * Find schema-declared keys whose alias list matches no detected placeholder.
+ * Orphans are exit-2 errors by design (catch schema drift early).
+ *
+ * @param {Schema|null} schema
+ * @param {Placeholder[]} placeholders
+ * @returns {Array<{key: string, aliases: string[]}>}
+ */
 export function findOrphans(schema, placeholders) {
   if (!schema) return [];
   const present = new Set(placeholders.map((p) => p.key));
@@ -829,6 +1031,18 @@ export function findOrphans(schema, placeholders) {
 }
 
 // ─── SUBSTITUTION ───────────────────────────────────────────────────────────
+/**
+ * Substitute resolved values into the template body. For T1/T2 (bracket /
+ * mustache) we replace the literal match span; for T3/T4/T5 we do a
+ * whole-word regex replace on the matched phrase. The original body is
+ * preserved byte-for-byte except at substitution sites.
+ *
+ * @param {string} body
+ * @param {Placeholder[]} placeholders
+ * @param {Object<string, string>} values — key -> value, from {@link resolveValues}.
+ * @param {Tier} tier
+ * @returns {string} the substituted body.
+ */
 export function substitute(body, placeholders, values, tier) {
   let out = body;
   for (const p of placeholders) {
@@ -1075,7 +1289,7 @@ async function confirmTty(prompt) {
 const BOOLEAN_FLAGS_FOR_COMPLETION = [
   "--help", "--version", "--demo",
   "--validate", "--list-placeholders",
-  "--why", "--json", "--interactive",
+  "--why", "--json", "--silent", "--interactive",
   "--no-heuristic", "--yes-heuristic",
   "--no-llm", "--llm",
 ];
@@ -1084,6 +1298,13 @@ const VALUE_FLAGS_FOR_COMPLETION = [
   "--params", "--output", "--syntax", "--dictionary", "--completion",
 ];
 
+/**
+ * Emit a shell completion script for the given shell.
+ *
+ * @param {"bash"|"zsh"} shell
+ * @returns {string} the completion script body.
+ * @throws {Error} with `.exitCode = EXIT.IO` for unsupported shells.
+ */
 export function completionScript(shell) {
   if (shell === "bash") return bashCompletion();
   if (shell === "zsh") return zshCompletion();
@@ -1124,7 +1345,7 @@ _draft_completion() {
   if [[ "$cur" == --* ]]; then
     COMPREPLY=( $(compgen -W "${allFlags}" -- "$cur") )
   elif [[ "$cur" == -* ]]; then
-    COMPREPLY=( $(compgen -W "-h -V -i -o ${allFlags}" -- "$cur") )
+    COMPREPLY=( $(compgen -W "-h -V -i -o -q ${allFlags}" -- "$cur") )
   else
     COMPREPLY=( $(compgen -f -- "$cur") )
   fi
@@ -1154,6 +1375,8 @@ _draft() {
     '--list-placeholders[enumerate placeholders and exit]'
     '--why[structured explanation to stderr]'
     '--json[machine-readable output on stdout]'
+    '--silent[suppress all stderr output]'
+    '-q[suppress all stderr output]'
     '--interactive[prompt for missing required params]'
     '-i[prompt for missing required params]'
     '--no-heuristic[disable tier 4]'
@@ -1212,9 +1435,31 @@ export function runDemo(out, err) {
 }
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
+// A stderr-like sink that drops everything. Used when --silent is set so
+// downstream pipelines see zero stderr noise. Note: parse-time errors still
+// go to the real stderr (--silent isn't honored until args are parsed).
+const SILENT_STREAM = { write() {}, isTTY: false };
+
+/**
+ * The CLI entry point. Parses argv, resolves the input, runs the selected
+ * mode (draft / list-placeholders / validate / demo / completion), and
+ * returns the exit code.
+ *
+ * @param {string[]} argv — typically `process.argv.slice(2)`.
+ * @param {{
+ *   out?: NodeJS.WritableStream,
+ *   err?: NodeJS.WritableStream,
+ *   cwd?: string,
+ *   env?: Object<string, string>,
+ *   fetcher?: typeof fetch,
+ *   spawner?: typeof spawnSync,
+ *   stdinReader?: () => Promise<string>,
+ * }} [io] — injection seam for tests.
+ * @returns {Promise<number>} one of {@link EXIT}'s values.
+ */
 export async function main(argv, io = {}) {
   const out = io.out || process.stdout;
-  const err = io.err || process.stderr;
+  const realErr = io.err || process.stderr;
   const cwd = io.cwd || process.cwd();
   const fetcher = io.fetcher;
   const spawner = io.spawner || spawnSync;
@@ -1224,10 +1469,12 @@ export async function main(argv, io = {}) {
   let opts;
   try { opts = parseArgs(argv); }
   catch (e) {
-    err.write(paint(`error: ${e.message}\n`, "red", err));
-    err.write(`run \`draft --help\` for usage.\n`);
+    realErr.write(paint(`error: ${e.message}\n`, "red", realErr));
+    realErr.write(`run \`draft --help\` for usage.\n`);
     return EXIT.IO;
   }
+
+  const err = opts.silent ? SILENT_STREAM : realErr;
 
   if (opts.help) { out.write(HELP_TEXT); return EXIT.OK; }
   if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
