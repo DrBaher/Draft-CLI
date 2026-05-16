@@ -1,0 +1,1757 @@
+#!/usr/bin/env node
+// draft-cli — fill placeholders in legal-document templates.
+// Part of the contract-operations suite. MIT. See LICENSE.
+// Single-file Node.js CLI. Stdlib-only except `jszip` for .docx unzip.
+
+import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { resolve, dirname, basename, extname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+
+/**
+ * @typedef {"bracket"|"mustache"|"docx-highlight"|"heuristic"|"llm"|"none"} Tier
+ *
+ * @typedef {Object} DetectionHit
+ *   A single raw detection from one of the cascade tiers.
+ * @property {string} match — the full matched span (e.g. "[Party A]").
+ * @property {string} inner — the text inside the delimiters (e.g. "Party A").
+ * @property {number} [index] — byte offset into the body, if known.
+ * @property {string} [suggested_key] — only on T5/LLM hits.
+ * @property {string} [color] — only on T3/docx-highlight hits.
+ *
+ * @typedef {Object} Placeholder
+ *   An assembled placeholder — one canonical key, all its hits, schema metadata.
+ * @property {string} key — canonical snake_case identifier.
+ * @property {string} first_seen_as — the inner text of the first hit.
+ * @property {number} occurrences — number of hits for this key.
+ * @property {Tier} tier — which cascade tier produced this.
+ * @property {boolean} required — whether the user MUST supply a value.
+ * @property {string|null} default — schema-supplied fallback, or null.
+ * @property {string[]} aliases — phrase forms that map to this key.
+ * @property {DetectionHit[]} hits — every detection for this key.
+ *
+ * @typedef {Object} SchemaEntry
+ * @property {string[]} aliases — phrase forms accepted for this key.
+ * @property {boolean} required
+ * @property {string|null} default
+ *
+ * @typedef {Object} Schema
+ * @property {"short"|"long"} form
+ * @property {Object<string, SchemaEntry>} entries
+ * @property {string} [sourcePath] — file the schema was loaded from, if any.
+ *
+ * @typedef {Object} ParsedArgs
+ *   Result of parseArgs(argv). See parseArgs() for shape.
+ *
+ * @typedef {Object} CascadeResult
+ * @property {Tier} tier
+ * @property {Placeholder[]} placeholders
+ * @property {string[]} warnings
+ * @property {Array<{phrase: string, tier: Tier}>} unmapped
+ * @property {boolean} [heuristicGate] — true iff tier='heuristic' and
+ *   substitution requires explicit confirmation.
+ *
+ * @typedef {Object} ResolvedValues
+ * @property {Object<string, string>} resolved — key -> value.
+ * @property {Placeholder[]} missing — unresolved required placeholders.
+ * @property {Object<string, "cli"|"params"|"interactive"|"default">} sources
+ *
+ * @typedef {Object} Input
+ * @property {"text"|"docx"} kind
+ * @property {string} body — the template text (extracted for docx).
+ * @property {string|null} path — filesystem path, or null for stdin/vault.
+ * @property {string} [docxXml] — raw word/document.xml for docx inputs.
+ *
+ * @typedef {Object} LlmProvider
+ * @property {string} provider — "anthropic" | "openai" | custom.
+ * @property {string} apiKey
+ * @property {string|null} model
+ */
+
+/** @type {string} */
+export const VERSION = "0.1.0";
+
+// ─── EXIT CODES ─────────────────────────────────────────────────────────────
+/**
+ * Stable exit codes. Documented in AGENTS.md and never re-numbered without
+ * a major-version bump.
+ * @type {Readonly<{OK: 0, IO: 1, VALIDATION: 2, VAULT: 3, LLM: 4}>}
+ */
+export const EXIT = Object.freeze({ OK: 0, IO: 1, VALIDATION: 2, VAULT: 3, LLM: 4 });
+
+// ─── COLOR (honors NO_COLOR / FORCE_COLOR) ──────────────────────────────────
+const ANSI = {
+  reset: "\x1b[0m", red: "\x1b[31m", green: "\x1b[32m",
+  yellow: "\x1b[33m", cyan: "\x1b[36m", dim: "\x1b[2m", bold: "\x1b[1m",
+};
+
+/**
+ * Whether ANSI color should be emitted to `stream`. Honors the no-color.org
+ * convention: `NO_COLOR` (any value) → off, `FORCE_COLOR` (any value) → on,
+ * otherwise on iff `stream.isTTY`.
+ *
+ * @param {{isTTY?: boolean} | null | undefined} stream
+ * @returns {boolean}
+ */
+export function colorEnabled(stream) {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR) return true;
+  return Boolean(stream && stream.isTTY);
+}
+
+/**
+ * Wrap `s` with an ANSI color code if {@link colorEnabled} for `stream`.
+ *
+ * @param {string} s
+ * @param {"red"|"green"|"yellow"|"cyan"|"dim"|"bold"} color
+ * @param {{isTTY?: boolean} | null | undefined} stream
+ * @returns {string}
+ */
+export function paint(s, color, stream) {
+  return colorEnabled(stream) ? `${ANSI[color] || ""}${s}${ANSI.reset}` : String(s);
+}
+
+// ─── BUNDLED HEURISTIC DICTIONARY ───────────────────────────────────────────
+export const DEFAULT_HEURISTIC_DICT = [
+  "John Doe", "Jane Doe", "Jane Roe", "John Smith", "John Q. Public",
+  "Acme Corporation", "Acme Corp.", "Acme Corp", "Acme Inc.", "Acme Inc",
+  "Acme Co.", "Acme Co", "Acme LLC", "Acme, Inc.",
+  "Foo Corp", "Foo Corp.", "Foo Inc.", "Foo Inc", "Foo LLC",
+  "FooBar LLC", "FooBar, Inc.",
+  "Example Inc.", "Example Inc", "Example Corporation", "Example Corp",
+  "Sample Company", "Sample Corp", "Sample Inc.",
+  "Newco", "Newco Inc.", "Newco Inc",
+  "123 Main Street", "123 Main St.", "123 Main St",
+  "1 First Avenue", "1 First Ave", "1 First Ave.",
+  "Anytown, USA", "Anytown, US",
+  "example@example.com", "user@example.com", "john@example.com",
+  "jane@example.com", "test@test.com",
+  "555-555-5555", "(555) 555-5555", "+1-555-555-5555",
+  "555-5555", "555-1234",
+  "January 1, 20XX", "MM/DD/YYYY", "DD/MM/YYYY",
+  "YYYY-MM-DD", "20XX-XX-XX",
+  "TBD", "TBC", "TBA",
+];
+
+// ─── .env READER (tiny inline parser) ───────────────────────────────────────
+/**
+ * Read a `.env` file. Tiny inline parser — handles `KEY=VALUE`, comments,
+ * blanks, and matched single/double quotes around values. Returns `{}` if
+ * the file doesn't exist.
+ *
+ * @param {string} path — usually `join(cwd, ".env")`.
+ * @returns {Object<string, string>}
+ */
+export function readDotenv(path) {
+  if (!existsSync(path)) return {};
+  const out = {};
+  for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+/**
+ * Merge `.env` file contents with the process environment. Process env
+ * always wins where both define a key.
+ *
+ * @param {string} [cwd]
+ * @param {Object<string, string>} [processEnv]
+ * @returns {Object<string, string>}
+ */
+export function effectiveEnv(cwd = process.cwd(), processEnv = process.env) {
+  const fileEnv = readDotenv(join(cwd, ".env"));
+  return { ...fileEnv, ...processEnv };
+}
+
+/**
+ * Pick an LLM provider configuration from a merged env object. Order:
+ * explicit `DRAFT_LLM_*` triple > `ANTHROPIC_API_KEY` > `OPENAI_API_KEY`.
+ *
+ * @param {Object<string, string>} envObj
+ * @returns {LlmProvider | null} null if no provider is configured.
+ */
+export function llmProviderFromEnv(envObj) {
+  if (envObj.DRAFT_LLM_PROVIDER && envObj.DRAFT_LLM_API_KEY) {
+    return {
+      provider: envObj.DRAFT_LLM_PROVIDER,
+      apiKey: envObj.DRAFT_LLM_API_KEY,
+      model: envObj.DRAFT_LLM_MODEL || null,
+    };
+  }
+  if (envObj.ANTHROPIC_API_KEY) {
+    return {
+      provider: "anthropic",
+      apiKey: envObj.ANTHROPIC_API_KEY,
+      model: envObj.DRAFT_LLM_MODEL || "claude-sonnet-4-6",
+    };
+  }
+  if (envObj.OPENAI_API_KEY) {
+    return {
+      provider: "openai",
+      apiKey: envObj.OPENAI_API_KEY,
+      model: envObj.DRAFT_LLM_MODEL || "gpt-4o-mini",
+    };
+  }
+  return null;
+}
+
+// ─── ARG PARSING ────────────────────────────────────────────────────────────
+// Two-phase: known flags first, unknown --x VALUE pairs collected for later
+// param resolution. Boolean flags listed in KNOWN_BOOLEAN; value flags in
+// KNOWN_VALUE. Everything else --x is treated as a param flag.
+const KNOWN_BOOLEAN = new Set([
+  "--help", "-h", "--version", "-V", "--demo",
+  "--validate", "--list-placeholders",
+  "--why", "--json", "--interactive", "-i",
+  "--no-heuristic", "--yes-heuristic",
+  "--no-llm", "--llm", "--check-llm",
+  "--silent", "-q",
+  "--diff",
+]);
+
+const KNOWN_VALUE = new Set([
+  "--params", "--output", "-o", "--syntax", "--dictionary", "--completion",
+]);
+
+/**
+ * Parse argv into a structured options object. Two-phase: known flags are
+ * recognized explicitly; everything else of the form `--xxx VALUE` is
+ * collected into `paramFlags` (canonical_key → value).
+ *
+ * @param {string[]} argv — typically `process.argv.slice(2)`.
+ * @returns {ParsedArgs}
+ * @throws {UsageError} on invalid `--syntax`, `--completion`, missing values.
+ */
+export function parseArgs(argv) {
+  const opts = {
+    positional: [],
+    params: null,
+    output: null,
+    syntax: "bracket",
+    dictionary: null,
+    interactive: false,
+    validate: false,
+    listPlaceholders: false,
+    why: false,
+    json: false,
+    demo: false,
+    completion: null,
+    silent: false,
+    checkLlm: false,
+    diff: false,
+    noHeuristic: false,
+    yesHeuristic: false,
+    noLlm: false,
+    forceLlm: false,
+    help: false,
+    version: false,
+    paramFlags: {}, // canonical_key -> value (set from --kebab-name VALUE)
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--help" || a === "-h") { opts.help = true; continue; }
+    if (a === "--version" || a === "-V") { opts.version = true; continue; }
+    if (a === "--demo") { opts.demo = true; continue; }
+    if (a === "--validate") { opts.validate = true; continue; }
+    if (a === "--list-placeholders") { opts.listPlaceholders = true; continue; }
+    if (a === "--why") { opts.why = true; continue; }
+    if (a === "--json") { opts.json = true; continue; }
+    if (a === "--interactive" || a === "-i") { opts.interactive = true; continue; }
+    if (a === "--no-heuristic") { opts.noHeuristic = true; continue; }
+    if (a === "--yes-heuristic") { opts.yesHeuristic = true; continue; }
+    if (a === "--no-llm") { opts.noLlm = true; continue; }
+    if (a === "--llm") { opts.forceLlm = true; continue; }
+    if (a === "--check-llm") { opts.checkLlm = true; continue; }
+    if (a === "--silent" || a === "-q") { opts.silent = true; continue; }
+    if (a === "--diff") { opts.diff = true; continue; }
+    if (a === "--params") { opts.params = argv[++i]; continue; }
+    if (a === "--output" || a === "-o") { opts.output = argv[++i]; continue; }
+    if (a === "--syntax") {
+      const v = argv[++i];
+      if (v !== "bracket" && v !== "mustache") {
+        throw new UsageError(`--syntax must be 'bracket' or 'mustache' (got '${v}')`);
+      }
+      opts.syntax = v;
+      continue;
+    }
+    if (a === "--dictionary") { opts.dictionary = argv[++i]; continue; }
+    if (a === "--completion") {
+      const v = argv[++i];
+      if (v !== "bash" && v !== "zsh") {
+        throw new UsageError(`--completion must be 'bash' or 'zsh' (got '${v}')`);
+      }
+      opts.completion = v;
+      continue;
+    }
+    if (a.startsWith("--")) {
+      // Unknown --x — treat as param flag with the next token as value.
+      const key = kebabToSnake(a.slice(2));
+      if (i + 1 >= argv.length || argv[i + 1].startsWith("-")) {
+        throw new UsageError(`flag ${a} requires a value`);
+      }
+      opts.paramFlags[key] = argv[++i];
+      continue;
+    }
+    opts.positional.push(a);
+  }
+  return opts;
+}
+
+export class UsageError extends Error {
+  constructor(msg) { super(msg); this.name = "UsageError"; }
+}
+
+// ─── KEY DERIVATION ─────────────────────────────────────────────────────────
+/** @param {string} s @returns {string} kebab-case → snake_case. */
+export function kebabToSnake(s) { return s.replace(/-/g, "_"); }
+
+/**
+ * Derive a canonical snake_case key from arbitrary placeholder text.
+ * Permissive: non-alphanumerics collapse to `_`, leading-digit inputs get
+ * an `_` prefix, length capped at 60. Always produces a valid snake_case
+ * key for any non-empty input that contains at least one alphanumeric.
+ *
+ * @param {string} matchText — e.g. "Party A Name", "Today's date", "1 year(s)".
+ * @returns {string} e.g. "party_a_name", "today_s_date", "_1_year_s".
+ */
+export function canonicalKey(matchText) {
+  // Permissive slug: lowercase, non-alphanum runs become single "_",
+  // strip leading/trailing "_", prefix "_" if leading char is a digit.
+  let k = matchText.trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (/^[0-9]/.test(k)) k = "_" + k;
+  // Cap at 60 chars to keep CLI flags usable.
+  if (k.length > 60) k = k.slice(0, 60).replace(/_+$/, "");
+  return k;
+}
+
+const VALID_KEY_RE = /^[a-z_][a-z0-9_]*$/;
+/** @param {string} key @returns {boolean} */
+export function validKey(key) { return VALID_KEY_RE.test(key); }
+
+// ─── HELP ───────────────────────────────────────────────────────────────────
+export const HELP_TEXT = `\
+draft — fill placeholders in a legal-document template.
+
+USAGE
+  draft <template>          [--params FILE] [--<PARAM> VALUE]... [options]
+  draft <category>/<name>   (pulls via \`template-vault get\`)
+  draft -                   (template body on stdin)
+  draft --list-placeholders <template> [--json]
+  draft --validate <template> --params FILE
+  draft --demo              (bundled demo, no file needed)
+  draft --completion bash   (emit shell completion script)
+
+DETECTION CASCADE  (sequential-with-stop; first non-empty tier wins)
+  1. bracket        [Title Case]              deterministic, default on
+  2. mustache       {{Title Case}}            opt-in via --syntax mustache
+  3. docx-highlight yellow / green / cyan     auto when input is .docx
+  4. heuristic      generic-name dictionary   --no-heuristic to skip;
+                                              warn-only without --yes-heuristic
+  5. llm            last resort               runs only if .env or process env
+                                              configures a provider; --no-llm
+                                              disables; --llm forces
+
+OPTIONS
+  --params FILE         JSON file of param values (snake_case keys).
+  -o, --output PATH     Write result to PATH (default: stdout).
+  --syntax KIND         'bracket' (default) or 'mustache'.
+  -i, --interactive     Prompt for any missing required parameters.
+  --validate            Validate completeness; never writes output.
+  --list-placeholders   Enumerate placeholders and exit.
+  --why                 Print a structured explanation to stderr.
+  --json                Emit JSON to stdout (suppresses human messages).
+  -q, --silent          Suppress all stderr output (warnings, --why, notes).
+  --no-heuristic        Disable tier 4.
+  --yes-heuristic       Substitute tier-4 matches without confirmation.
+  --no-llm              Disable tier 5 even when env is configured.
+  --llm                 Assert env-configured LLM; fail-fast if not.
+  --check-llm           One-token roundtrip to the configured provider.
+  --diff                Show substitution table without writing output.
+  --dictionary PATH     Override the bundled heuristic dictionary.
+  --completion bash|zsh Emit a shell completion script to stdout.
+  --<param-name> VALUE  Set a parameter directly. Kebab -> snake_case.
+  -h, --help            Show this help.
+  -V, --version         Show version.
+
+EXIT CODES
+  0 ok   1 i/o error   2 validation   3 template-vault failure   4 llm failure
+
+Part of the contract-operations suite. See cli.drbaher.com.
+`;
+
+// ─── INPUT RESOLUTION ───────────────────────────────────────────────────────
+// Returns { kind: "text"|"docx", body: string, docxXml?: string, path: string|null }
+const VAULT_REF_RE = /^[a-z][a-z0-9-]*\/[a-z0-9-]+(?:@[A-Za-z0-9._-]+)?$/;
+
+/**
+ * Resolve a positional template argument into a usable {@link Input}.
+ * Handles three forms: stdin (`-`), a `template-vault get` ref
+ * (`<category>/<name>[@version]`), or a filesystem path (text or `.docx`).
+ *
+ * @param {string} arg
+ * @param {{ spawner?: typeof spawnSync, stdinReader?: () => Promise<string> }} [opts]
+ *   Injectable spawn / stdin reader for tests.
+ * @returns {Promise<Input>}
+ * @throws {Error} with `.exitCode` set to one of {@link EXIT}'s values on
+ *   I/O failure (1), vault subprocess failure (3), or `.docx` parse failure (1).
+ */
+export async function resolveInput(arg, { spawner = spawnSync, stdinReader = readStdin } = {}) {
+  if (arg === "-") {
+    return { kind: "text", body: await stdinReader(), path: null };
+  }
+  if (VAULT_REF_RE.test(arg)) {
+    const r = spawner("template-vault", ["get", arg], { encoding: "utf8" });
+    if (r.error || r.status !== 0) {
+      const msg = (r.stderr || "").toString().trim() || (r.error && r.error.message) ||
+                  `template-vault get ${arg} failed`;
+      const e = new Error(msg);
+      e.exitCode = EXIT.VAULT;
+      throw e;
+    }
+    return { kind: "text", body: (r.stdout || "").toString(), path: null };
+  }
+  if (!existsSync(arg)) {
+    const e = new Error(`template not found: ${arg}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  const ext = extname(arg).toLowerCase();
+  if (ext === ".docx") {
+    const { body, xml } = await extractDocxText(arg);
+    return { kind: "docx", body, docxXml: xml, path: arg };
+  }
+  return { kind: "text", body: readFileSync(arg, "utf8"), path: arg };
+}
+
+/**
+ * Read stdin to completion as a UTF-8 string.
+ * @returns {Promise<string>}
+ */
+export async function readStdin() {
+  return await new Promise((res, rej) => {
+    let s = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => res(s));
+    process.stdin.on("error", rej);
+  });
+}
+
+// ─── DOCX EXTRACTION (jszip + regex on word/document.xml) ───────────────────
+async function loadJSZip() {
+  try { return (await import("jszip")).default; }
+  catch {
+    const e = new Error("the 'jszip' package is required for .docx input.\nrun: npm install -g jszip  (or reinstall draft-cli)");
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+}
+
+/**
+ * Open a `.docx`, return its extracted plain-text body and the raw XML
+ * (the XML is needed for tier-3 highlight detection).
+ *
+ * @param {string} path
+ * @returns {Promise<{ body: string, xml: string }>}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing jszip, invalid
+ *   `.docx`, or missing `word/document.xml`.
+ */
+export async function extractDocxText(path) {
+  const JSZip = await loadJSZip();
+  let zip;
+  try { zip = await JSZip.loadAsync(readFileSync(path)); }
+  catch (err) {
+    const e = new Error(`could not open .docx (${err.message})`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) {
+    const e = new Error("invalid .docx: missing word/document.xml");
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  const xml = await docFile.async("string");
+  return { body: docxXmlToText(xml), xml };
+}
+
+// Walk the XML in document order. For each <w:p> emit a line; concatenate
+// <w:t> contents within. Decode XML entities. Used for both output body and
+// T1/T2 detection on docx input.
+/**
+ * Walk Word's document XML in paragraph order and produce plain text.
+ * One line per `<w:p>`; text-run contents concatenated within. XML entities
+ * are decoded via {@link decodeXml}.
+ *
+ * @param {string} xml
+ * @returns {string}
+ */
+export function docxXmlToText(xml) {
+  const paragraphs = xml.split(/<w:p[\s>]/i).slice(1);
+  const lines = [];
+  for (const p of paragraphs) {
+    const para = p.split(/<\/w:p>/i)[0];
+    const texts = [];
+    const re = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
+    let m;
+    while ((m = re.exec(para)) !== null) texts.push(decodeXml(m[1]));
+    lines.push(texts.join(""));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Decode the five XML entities that appear in Word's `<w:t>` runs.
+ * @param {string} s
+ * @returns {string}
+ */
+export function decodeXml(s) {
+  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+const RECOGNIZED_HIGHLIGHTS = new Set(["yellow", "green", "cyan", "magenta"]);
+
+// Scan the XML for highlighted runs. Returns an array of { text, color }.
+/**
+ * Find every highlighted text run in a Word document's XML. Unlike
+ * {@link detectDocxHighlight}, does NOT dedupe — multiple occurrences of
+ * the same highlighted text appear multiple times.
+ *
+ * @param {string} xml
+ * @returns {Array<{ text: string, color: string }>}
+ */
+export function extractDocxHighlights(xml) {
+  const out = [];
+  const runRe = /<w:r\b[\s\S]*?<\/w:r>/g;
+  let m;
+  while ((m = runRe.exec(xml)) !== null) {
+    const run = m[0];
+    const hm = /<w:highlight\s+w:val="([^"]+)"/.exec(run);
+    if (!hm) continue;
+    const color = hm[1].toLowerCase();
+    if (!RECOGNIZED_HIGHLIGHTS.has(color)) continue;
+    const texts = [];
+    const tRe = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
+    let tm;
+    while ((tm = tRe.exec(run)) !== null) texts.push(decodeXml(tm[1]));
+    const text = texts.join("").trim();
+    if (text) out.push({ text, color });
+  }
+  return out;
+}
+
+// ─── TIER 1: BRACKET ────────────────────────────────────────────────────────
+// Match [...] runs that are NOT immediately followed by '(' (markdown link).
+const BRACKET_RE = /\[([^\[\]\n]{1,200})\](?!\()/g;
+const SECTION_REF_RE = /^\d+(?:\.\d+)*$/;
+const CHECKBOX_RE = /^[ xX]{1,3}$/;
+
+/**
+ * The locked T1 admission rule. Rejects markdown links, checkbox markers,
+ * pure section refs, punctuation-only runs, and all-uppercase headings.
+ * Permissive otherwise — accepts sentence-shaped placeholders with full
+ * punctuation, as real legal templates use.
+ *
+ * @param {string} inner — bracket contents (no `[` `]`).
+ * @returns {boolean}
+ */
+export function isBracketPlaceholder(inner) {
+  if (!inner) return false;
+  if (CHECKBOX_RE.test(inner)) return false;
+  if (SECTION_REF_RE.test(inner)) return false;
+  // Must contain at least one letter so we don't catch [___] or [---].
+  if (!/[A-Za-z]/.test(inner)) return false;
+  // Reject all-caps headings ([CONFIDENTIALITY], [ARTICLE I]).
+  if (inner === inner.toUpperCase() && /[A-Z]/.test(inner)) return false;
+  return true;
+}
+
+/**
+ * Tier 1 detection: bracketed `[...]` placeholders.
+ *
+ * `schemaAliases` (optional) is a Set of phrase strings declared in the
+ * schema file; bracketed runs whose inner matches a schema alias are
+ * admitted even if the heuristic rule {@link isBracketPlaceholder} would
+ * reject them (lets a schema rescue `[COMPANY]`, `[_____________]`, etc.).
+ *
+ * @param {string} body
+ * @param {Set<string>} [schemaAliases]
+ * @returns {DetectionHit[]}
+ */
+export function detectBracket(body, schemaAliases = new Set()) {
+  const out = [];
+  let m;
+  BRACKET_RE.lastIndex = 0;
+  while ((m = BRACKET_RE.exec(body)) !== null) {
+    if (isBracketPlaceholder(m[1]) || schemaAliases.has(m[1])) {
+      out.push({ match: m[0], inner: m[1], index: m.index });
+    }
+  }
+  return out;
+}
+
+// ─── TIER 2: MUSTACHE ───────────────────────────────────────────────────────
+const MUSTACHE_RE = /\{\{\s*([^{}\n]{1,80}?)\s*\}\}/g;
+const SNAKE_RE = /^[a-z][a-z0-9_]{0,78}$/;
+
+/**
+ * T2 admission rule. Accepts snake_case or Title-Case inner text.
+ * @param {string} inner
+ * @returns {boolean}
+ */
+export function isMustachePlaceholder(inner) {
+  if (SNAKE_RE.test(inner)) return true;
+  return isBracketPlaceholder(inner);
+}
+
+/**
+ * Tier 2 detection: `{{Title Case}}` or `{{snake_case}}` mustache placeholders.
+ * Only invoked when `--syntax mustache` is selected. Schema-rescue same as T1.
+ *
+ * @param {string} body
+ * @param {Set<string>} [schemaAliases]
+ * @returns {DetectionHit[]}
+ */
+export function detectMustache(body, schemaAliases = new Set()) {
+  const out = [];
+  let m;
+  MUSTACHE_RE.lastIndex = 0;
+  while ((m = MUSTACHE_RE.exec(body)) !== null) {
+    const inner = m[1].trim();
+    if (isMustachePlaceholder(inner) || schemaAliases.has(inner)) {
+      out.push({ match: m[0], inner, index: m.index });
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether `body` contains both bracket and mustache placeholders.
+ * Triggers the mixed-convention `--why`/stderr warning.
+ *
+ * @param {string} body
+ * @returns {boolean}
+ */
+export function hasBothConventions(body) {
+  return detectBracket(body).length > 0 && detectMustache(body).length > 0;
+}
+
+// ─── TIER 3: DOCX HIGHLIGHT ─────────────────────────────────────────────────
+/**
+ * Tier 3 detection: scan a Word document's XML for highlighted text runs.
+ * Recognizes yellow / green / cyan / magenta highlights as placeholders;
+ * other colors are ignored. Dedupes by exact text match.
+ *
+ * @param {string} xml — content of `word/document.xml`.
+ * @returns {DetectionHit[]}
+ */
+export function detectDocxHighlight(xml) {
+  if (!xml) return [];
+  const hits = extractDocxHighlights(xml);
+  const seen = new Map();
+  for (const { text, color } of hits) {
+    if (!seen.has(text)) seen.set(text, { match: text, inner: text, color });
+  }
+  return [...seen.values()];
+}
+
+// ─── TIER 4: HEURISTIC ──────────────────────────────────────────────────────
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/**
+ * Tier 4 detection: scan body for known generic-placeholder phrases from a
+ * curated dictionary. Whole-word matching only. Returns one entry per
+ * phrase that appears (dedupe by phrase).
+ *
+ * Note: substitute() does a global regex replace on T4 hits, so a single
+ * detection may correspond to multiple substitutions in the output.
+ *
+ * @param {string} body
+ * @param {string[]} [dict] — phrases to look for. Defaults to {@link DEFAULT_HEURISTIC_DICT}.
+ * @returns {DetectionHit[]}
+ */
+export function detectHeuristic(body, dict = DEFAULT_HEURISTIC_DICT) {
+  const out = [];
+  const seen = new Set();
+  for (const phrase of dict) {
+    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegex(phrase)}(?![A-Za-z0-9])`, "g");
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      if (!seen.has(phrase)) {
+        seen.add(phrase);
+        out.push({ match: phrase, inner: phrase, index: m.index });
+      }
+      break; // count once per phrase for detection; substitution replaces all
+    }
+  }
+  return out;
+}
+
+// ─── TIER 5: LLM ────────────────────────────────────────────────────────────
+/**
+ * Tier 5 detection: ask an LLM to suggest placeholders in the body.
+ *
+ * Sends template text ONLY. Does not include params, schema, or env. The
+ * provider's response is parsed as `{ placeholders: [{text, suggested_key}] }`;
+ * malformed entries are dropped silently. Tests inject a `fetcher` so they
+ * never make real network calls.
+ *
+ * @param {string} body
+ * @param {LlmProvider} providerCfg
+ * @param {{ fetcher?: typeof fetch | null }} [opts]
+ * @returns {Promise<DetectionHit[]>}
+ * @throws {Error} with `.exitCode = EXIT.LLM` on auth, transport, or
+ *   parse failure.
+ */
+export async function detectLlm(body, providerCfg, { fetcher = (typeof fetch !== "undefined" ? fetch : null) } = {}) {
+  if (!fetcher) {
+    const e = new Error("fetch is not available; Node 18+ is required for the LLM tier");
+    e.exitCode = EXIT.LLM;
+    throw e;
+  }
+  const prompt = `You are a placeholder detector for a legal-document drafting tool.
+Given the document text below, identify spans that look like placeholders — names, dates, or
+party-identifier text that a drafter would replace before sending. Do NOT detect cross-references
+or section labels. Output JSON ONLY in this exact shape:
+{"placeholders":[{"text":"<verbatim span>","suggested_key":"<snake_case_key>"}]}
+
+If you find nothing, output {"placeholders":[]}.
+
+DOCUMENT:
+${body.slice(0, 12000)}`;
+  const raw = await callLlm(providerCfg, prompt, fetcher);
+  let parsed;
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+  } catch {
+    const e = new Error(`LLM returned non-JSON response`);
+    e.exitCode = EXIT.LLM;
+    throw e;
+  }
+  const items = Array.isArray(parsed.placeholders) ? parsed.placeholders : [];
+  const out = [];
+  const seen = new Set();
+  for (const it of items) {
+    if (!it || typeof it.text !== "string" || typeof it.suggested_key !== "string") continue;
+    if (!validKey(it.suggested_key)) continue;
+    if (seen.has(it.suggested_key)) continue;
+    seen.add(it.suggested_key);
+    out.push({ match: it.text, inner: it.text, suggested_key: it.suggested_key });
+  }
+  return out;
+}
+
+async function callLlm(cfg, prompt, fetcher) {
+  if (cfg.provider === "anthropic") {
+    const r = await fetcher("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": cfg.apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: cfg.model || "claude-sonnet-4-6",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) {
+      const e = new Error(`LLM call failed: ${r.status} ${await safeText(r)}`);
+      e.exitCode = EXIT.LLM;
+      throw e;
+    }
+    const j = await r.json();
+    return (j.content && j.content[0] && j.content[0].text) || "";
+  }
+  if (cfg.provider === "openai") {
+    const r = await fetcher("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${cfg.apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: cfg.model || "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) {
+      const e = new Error(`LLM call failed: ${r.status} ${await safeText(r)}`);
+      e.exitCode = EXIT.LLM;
+      throw e;
+    }
+    const j = await r.json();
+    return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+  }
+  const e = new Error(`unsupported LLM provider: ${cfg.provider}`);
+  e.exitCode = EXIT.LLM;
+  throw e;
+}
+
+async function safeText(r) { try { return await r.text(); } catch { return ""; } }
+
+// ─── SCHEMA LOADING ─────────────────────────────────────────────────────────
+// Returns { form: "short"|"long", entries: { [key]: { aliases, required, default } } }
+// or null if no schema file exists.
+/**
+ * Look for a sibling `<template>.params.json` and parse it.
+ *
+ * @param {string|null} templatePath — pass null for stdin / vault input.
+ * @returns {Schema|null} Parsed schema (with `.sourcePath` set) or null if no file.
+ * @throws {Error} with `.exitCode = EXIT.IO` on malformed JSON or invalid structure.
+ */
+export function loadSchema(templatePath) {
+  if (!templatePath) return null;
+  const candidate = templatePath.replace(/\.[^./]+$/, "") + ".params.json";
+  const alt = templatePath + ".params.json";
+  const file = existsSync(candidate) ? candidate : existsSync(alt) ? alt : null;
+  if (!file) return null;
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(file, "utf8")); }
+  catch (err) {
+    const e = new Error(`schema file ${file} is not valid JSON: ${err.message}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  const out = parseSchema(parsed, file);
+  out.sourcePath = file;
+  return out;
+}
+
+/**
+ * Validate and normalize a parsed JSON schema object. Auto-selects short vs
+ * long form based on the presence of a top-level `_meta` key.
+ *
+ * @param {Object} parsed — JSON.parse output of the schema file.
+ * @param {string} [sourceLabel] — used in error messages.
+ * @returns {Schema}
+ * @throws {Error} with `.exitCode = EXIT.IO` on invalid structure.
+ */
+export function parseSchema(parsed, sourceLabel = "<schema>") {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const e = new Error(`${sourceLabel}: top-level must be an object`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  const long = Object.prototype.hasOwnProperty.call(parsed, "_meta");
+  const entries = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (k.startsWith("_")) continue;
+    if (!validKey(k)) {
+      const e = new Error(`${sourceLabel}: invalid key '${k}' (must be snake_case)`);
+      e.exitCode = EXIT.IO;
+      throw e;
+    }
+    if (long) {
+      if (!v || typeof v !== "object" || !Array.isArray(v.aliases)) {
+        const e = new Error(`${sourceLabel}: long-form entry '${k}' must have an aliases array`);
+        e.exitCode = EXIT.IO;
+        throw e;
+      }
+      entries[k] = {
+        aliases: v.aliases.slice(),
+        required: v.required !== false,
+        default: Object.prototype.hasOwnProperty.call(v, "default") ? v.default : null,
+      };
+    } else {
+      if (!Array.isArray(v)) {
+        const e = new Error(`${sourceLabel}: short-form entry '${k}' must be an array of phrase strings`);
+        e.exitCode = EXIT.IO;
+        throw e;
+      }
+      entries[k] = { aliases: v.slice(), required: true, default: null };
+    }
+  }
+  return { form: long ? "long" : "short", entries };
+}
+
+// ─── DETECTION ORCHESTRATOR ─────────────────────────────────────────────────
+// Returns:
+// {
+//   tier: "bracket"|"mustache"|"docx-highlight"|"heuristic"|"llm",
+//   placeholders: [ { key, first_seen_as, occurrences, tier, hits:[{match,inner,index?}] } ],
+//   warnings: string[],
+//   unmapped: [{ phrase, tier }],
+// }
+/**
+ * Run the five-tier sequential-with-stop detection cascade on an input.
+ * The first tier to return ≥1 hit wins; subsequent tiers are skipped.
+ * Always emits a mixed-convention warning when both `[...]` and `{{...}}`
+ * appear in the body, regardless of which tier wins.
+ *
+ * @param {Input} input
+ * @param {ParsedArgs} opts
+ * @param {Schema|null} schema
+ * @param {Object<string, string>} envObj — merged file + process env.
+ * @param {{ fetcher?: typeof fetch }} [io] — for LLM tier mocking.
+ * @returns {Promise<CascadeResult>}
+ * @throws {Error} with `.exitCode = EXIT.LLM` if `--llm` was set but no
+ *   provider is configured.
+ */
+export async function runCascade(input, opts, schema, envObj, { fetcher } = {}) {
+  const warnings = [];
+  const body = input.body;
+  const provider = llmProviderFromEnv(envObj);
+
+  // Validate --llm up-front: if user asserts --llm, env must configure a provider.
+  if (opts.forceLlm && !provider) {
+    const e = new Error("--llm requires an LLM provider configured in .env or process env (ANTHROPIC_API_KEY, OPENAI_API_KEY, or DRAFT_LLM_*)");
+    e.exitCode = EXIT.LLM;
+    throw e;
+  }
+
+  // Mixed-convention warning regardless of cascade outcome.
+  if (hasBothConventions(body)) {
+    const b = detectBracket(body).length;
+    const m = detectMustache(body).length;
+    warnings.push(`mixed placeholder conventions: ${b} bracket, ${m} mustache (using --syntax ${opts.syntax})`);
+  }
+
+  // Pre-compute the schema's union of declared phrase forms so detection can
+  // rescue placeholders the heuristic rule would otherwise reject (e.g. all-
+  // caps signature-block markers like [COMPANY], or fill-in markers like
+  // [_____________]). Without this, a schema-declared alias is silently
+  // dropped during detection and never reaches the alias-resolution step.
+  const schemaAliasSet = new Set();
+  if (schema) {
+    for (const entry of Object.values(schema.entries)) {
+      for (const a of entry.aliases) schemaAliasSet.add(a);
+    }
+  }
+
+  // Tier 1 / 2 (sequenced by --syntax; only the selected family runs).
+  if (opts.syntax === "bracket") {
+    const hits = detectBracket(body, schemaAliasSet);
+    if (hits.length > 0) {
+      return assemble("bracket", hits, schema, warnings);
+    }
+  } else {
+    const hits = detectMustache(body, schemaAliasSet);
+    if (hits.length > 0) {
+      return assemble("mustache", hits, schema, warnings);
+    }
+  }
+
+  // Tier 3 (docx-highlight) — only if input is .docx.
+  if (input.kind === "docx") {
+    const hits = detectDocxHighlight(input.docxXml);
+    if (hits.length > 0) {
+      return assemble("docx-highlight", hits, schema, warnings);
+    }
+  }
+
+  // Tier 4 (heuristic).
+  if (!opts.noHeuristic) {
+    const dict = opts.dictionary ? readDictionary(opts.dictionary) : DEFAULT_HEURISTIC_DICT;
+    const hits = detectHeuristic(body, dict);
+    if (hits.length > 0) {
+      const r = assemble("heuristic", hits, schema, warnings);
+      r.heuristicGate = true; // signal: requires confirmation
+      return r;
+    }
+  }
+
+  // Tier 5 (LLM) — auto-runs when a provider is configured and --no-llm is absent.
+  if (provider && !opts.noLlm) {
+    const hits = await detectLlm(body, provider, { fetcher });
+    if (hits.length > 0) {
+      return assemble("llm", hits, schema, warnings, /*fromLlm=*/true);
+    }
+  }
+
+  return { tier: "none", placeholders: [], warnings, unmapped: [] };
+}
+
+/**
+ * Read a custom heuristic dictionary file. Must be a JSON array of strings.
+ *
+ * @param {string} path
+ * @returns {string[]}
+ * @throws {Error} with `.exitCode = EXIT.IO` on read or parse failure.
+ */
+export function readDictionary(path) {
+  try {
+    const j = JSON.parse(readFileSync(path, "utf8"));
+    if (!Array.isArray(j)) throw new Error("dictionary file must be a JSON array of strings");
+    return j;
+  } catch (err) {
+    const e = new Error(`could not read dictionary ${path}: ${err.message}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+}
+
+function assemble(tier, hits, schema, warnings, fromLlm = false) {
+  // Group hits by canonical key (schema-aware).
+  const byKey = new Map();
+  const unmapped = [];
+  for (const h of hits) {
+    const resolved = resolveKey(h, schema, fromLlm);
+    if (!resolved) {
+      unmapped.push({ phrase: h.inner, tier });
+      continue;
+    }
+    if (!byKey.has(resolved.key)) {
+      byKey.set(resolved.key, {
+        key: resolved.key,
+        first_seen_as: h.inner,
+        occurrences: 0,
+        tier,
+        required: resolved.required,
+        default: resolved.default,
+        aliases: resolved.aliases,
+        hits: [],
+      });
+    }
+    const entry = byKey.get(resolved.key);
+    entry.occurrences += 1;
+    entry.hits.push(h);
+  }
+  return { tier, placeholders: [...byKey.values()], warnings, unmapped };
+}
+
+function resolveKey(hit, schema, fromLlm) {
+  if (schema) {
+    for (const [key, entry] of Object.entries(schema.entries)) {
+      if (entry.aliases.includes(hit.inner)) {
+        return { key, required: entry.required, default: entry.default, aliases: entry.aliases };
+      }
+    }
+    return null;
+  }
+  const key = fromLlm && hit.suggested_key ? hit.suggested_key : canonicalKey(hit.inner);
+  if (!validKey(key)) return null;
+  return { key, required: true, default: null, aliases: [hit.inner] };
+}
+
+// ─── VALUE RESOLUTION (CLI > JSON > prompt > default) ───────────────────────
+/**
+ * Read the JSON `--params` file. Returns `{}` if path is null.
+ *
+ * @param {string | null} path
+ * @returns {Object<string, *>}
+ * @throws {Error} with `.exitCode = EXIT.IO` on missing or invalid file.
+ */
+export function loadParamsFile(path) {
+  if (!path) return {};
+  if (!existsSync(path)) {
+    const e = new Error(`params file not found: ${path}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+  try {
+    const j = JSON.parse(readFileSync(path, "utf8"));
+    if (!j || typeof j !== "object" || Array.isArray(j)) {
+      const e = new Error(`params file ${path} must be a JSON object`);
+      e.exitCode = EXIT.IO;
+      throw e;
+    }
+    return j;
+  } catch (err) {
+    if (err.exitCode) throw err;
+    const e = new Error(`could not parse ${path}: ${err.message}`);
+    e.exitCode = EXIT.IO;
+    throw e;
+  }
+}
+
+/**
+ * Resolve a value for every placeholder using the locked precedence chain:
+ * CLI flag > `--params` JSON > `--interactive` prompt > schema default >
+ * (missing). Empty-string CLI values are considered supplied (not missing).
+ *
+ * @param {Placeholder[]} placeholders
+ * @param {ParsedArgs} opts
+ * @param {Object<string, *>} paramsObj — parsed JSON params file.
+ * @param {{ prompter?: (p: Placeholder) => Promise<string|null> }} [io]
+ * @returns {Promise<ResolvedValues>}
+ */
+export async function resolveValues(placeholders, opts, paramsObj, { prompter = nodePrompter } = {}) {
+  const resolved = {};
+  const missing = [];
+  const sources = {};
+  for (const p of placeholders) {
+    if (Object.prototype.hasOwnProperty.call(opts.paramFlags, p.key)) {
+      resolved[p.key] = opts.paramFlags[p.key];
+      sources[p.key] = "cli";
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(paramsObj, p.key)) {
+      resolved[p.key] = String(paramsObj[p.key]);
+      sources[p.key] = "params";
+      continue;
+    }
+    if (opts.interactive) {
+      const v = await prompter(p);
+      if (v !== null && v !== undefined && v !== "") {
+        resolved[p.key] = String(v);
+        sources[p.key] = "interactive";
+        continue;
+      }
+    }
+    if (p.default !== null && p.default !== undefined) {
+      resolved[p.key] = String(p.default);
+      sources[p.key] = "default";
+      continue;
+    }
+    if (p.required) missing.push(p);
+  }
+  return { resolved, missing, sources };
+}
+
+async function nodePrompter(placeholder) {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return await new Promise((res) => {
+    rl.question(`${placeholder.key} (${placeholder.first_seen_as}): `, (a) => {
+      rl.close(); res(a.trim());
+    });
+  });
+}
+
+// Schema declares params not present in the template → orphan error.
+/**
+ * Find schema-declared keys whose alias list matches no detected placeholder.
+ * Orphans are exit-2 errors by design (catch schema drift early).
+ *
+ * @param {Schema|null} schema
+ * @param {Placeholder[]} placeholders
+ * @returns {Array<{key: string, aliases: string[]}>}
+ */
+export function findOrphans(schema, placeholders) {
+  if (!schema) return [];
+  const present = new Set(placeholders.map((p) => p.key));
+  const orphans = [];
+  for (const [key, entry] of Object.entries(schema.entries)) {
+    if (!present.has(key)) orphans.push({ key, aliases: entry.aliases.slice() });
+  }
+  return orphans;
+}
+
+// ─── SUBSTITUTION ───────────────────────────────────────────────────────────
+/**
+ * Substitute resolved values into the template body. For T1/T2 (bracket /
+ * mustache) we replace the literal match span; for T3/T4/T5 we do a
+ * whole-word regex replace on the matched phrase. The original body is
+ * preserved byte-for-byte except at substitution sites.
+ *
+ * @param {string} body
+ * @param {Placeholder[]} placeholders
+ * @param {Object<string, string>} values — key -> value, from {@link resolveValues}.
+ * @param {Tier} tier
+ * @returns {string} the substituted body.
+ */
+export function substitute(body, placeholders, values, tier) {
+  let out = body;
+  for (const p of placeholders) {
+    const v = values[p.key];
+    if (v === undefined) continue;
+    for (const h of p.hits) {
+      if (tier === "bracket" || tier === "mustache") {
+        out = replaceAll(out, h.match, v);
+      } else {
+        // Tier 3/4/5: replace literal phrase (whole-word) globally.
+        const re = new RegExp(`(?<![A-Za-z0-9])${escapeRegex(h.inner)}(?![A-Za-z0-9])`, "g");
+        out = out.replace(re, v);
+      }
+    }
+  }
+  return out;
+}
+
+function replaceAll(s, find, repl) {
+  return s.split(find).join(repl);
+}
+
+// ─── --why BUILDER ──────────────────────────────────────────────────────────
+/**
+ * Format the `--why` stderr block. Stable shape across minor versions; see
+ * the `tier`, `placeholders`, `resolved`, `defaulted`, `unresolved`,
+ * `unmapped`, and `warnings` keys.
+ *
+ * @param {{
+ *   inputDescriptor: string,
+ *   schemaDescriptor: string,
+ *   tier: Tier,
+ *   placeholders: Placeholder[],
+ *   sources: Object<string, string>,
+ *   missing: Placeholder[],
+ *   unmapped: Array<{phrase: string, tier: Tier}>,
+ *   warnings: string[],
+ *   outputPath: string | null,
+ * }} args
+ * @returns {string}
+ */
+export function buildWhyBlock({ inputDescriptor, schemaDescriptor, tier, placeholders, sources, missing, unmapped, warnings, outputPath }) {
+  const counts = { cli: 0, params: 0, interactive: 0, default: 0 };
+  for (const s of Object.values(sources)) counts[s] = (counts[s] || 0) + 1;
+  const distinct = placeholders.length;
+  const occurrences = placeholders.reduce((acc, p) => acc + p.occurrences, 0);
+  const lines = [
+    `draft: substituted ${distinct - missing.length} of ${distinct} placeholders${outputPath ? ` → ${outputPath}` : ""}`,
+    `why:`,
+    `  input         = ${inputDescriptor}`,
+    `  tier          = ${tier}`,
+    `  schema        = ${schemaDescriptor}`,
+    `  placeholders  = ${distinct} distinct, ${occurrences} occurrences`,
+    `  resolved      = ${distinct - missing.length} (${counts.cli || 0} from CLI, ${counts.params || 0} from --params, ${counts.interactive || 0} interactive, ${counts.default || 0} default)`,
+    `  defaulted     = ${counts.default || 0}`,
+    `  unresolved    = ${missing.length}`,
+    `  unmapped      = ${unmapped.length}${unmapped.length ? ` (${unmapped.map(u => u.phrase).join(", ")})` : ""}`,
+    `  warnings      = ${warnings.length}`,
+  ];
+  return lines.join("\n");
+}
+
+// ─── COMMANDS ───────────────────────────────────────────────────────────────
+function publicPlaceholders(placeholders) {
+  return placeholders.map((p) => ({
+    key: p.key,
+    first_seen_as: p.first_seen_as,
+    aliases: p.aliases,
+    required: p.required,
+    occurrences: p.occurrences,
+    tier: p.tier,
+  }));
+}
+
+export async function cmdListPlaceholders(opts, input, schema, envObj, { fetcher, out, err } = {}) {
+  const result = await runCascade(input, opts, schema, envObj, { fetcher });
+  const placeholders = publicPlaceholders(result.placeholders);
+  if (opts.json) {
+    out.write(JSON.stringify({
+      template: input.path || (input.kind === "text" ? "-" : "<docx>"),
+      tier: result.tier,
+      placeholders,
+      warnings: result.warnings,
+      unmapped: result.unmapped,
+    }, null, 2) + "\n");
+  } else {
+    if (placeholders.length === 0) {
+      err.write(paint("no placeholders detected.\n", "yellow", err));
+    } else {
+      for (const p of placeholders) {
+        out.write(`${p.key}  (${p.first_seen_as})${p.aliases.length > 1 ? `  aliases: ${p.aliases.join(", ")}` : ""}  ×${p.occurrences}  [tier=${p.tier}]\n`);
+      }
+    }
+    for (const w of result.warnings) err.write(paint(`warning: ${w}\n`, "yellow", err));
+  }
+  return EXIT.OK;
+}
+
+export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err } = {}) {
+  const result = await runCascade(input, opts, schema, envObj, { fetcher });
+  if (result.tier === "none") {
+    err.write(paint("error: no placeholders detected by any tier\n", "red", err));
+    return EXIT.VALIDATION;
+  }
+  const orphans = findOrphans(schema, result.placeholders);
+  if (orphans.length > 0) {
+    for (const o of orphans) {
+      err.write(paint(`error: schema declares "${o.key}" with aliases [${o.aliases.map(a => `"${a}"`).join(",")}], but no matching phrase was detected by tier '${result.tier}'.\n`, "red", err));
+    }
+    return EXIT.VALIDATION;
+  }
+  const { resolved, missing, sources } = await resolveValues(result.placeholders, opts, paramsObj);
+  if (missing.length > 0) {
+    printMissing(missing, err);
+    if (opts.json) {
+      out.write(JSON.stringify({ ok: false, missing: missing.map(m => m.key) }, null, 2) + "\n");
+    }
+    return EXIT.VALIDATION;
+  }
+  if (opts.json) {
+    out.write(JSON.stringify({ ok: true, resolved: Object.keys(resolved), sources }, null, 2) + "\n");
+  } else {
+    err.write(paint(`ok: ${Object.keys(resolved).length} parameter(s) resolved\n`, "green", err));
+  }
+  return EXIT.OK;
+}
+
+export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err } = {}) {
+  const result = await runCascade(input, opts, schema, envObj, { fetcher });
+  if (result.tier === "none") {
+    const hasProvider = Boolean(llmProviderFromEnv(envObj));
+    err.write(paint(
+      `error: no placeholders detected by deterministic tiers (bracket, mustache, docx-highlight, heuristic).\n` +
+      (hasProvider
+        ? `hint: pass --llm to invoke LLM detection explicitly.\n`
+        : `hint: set ANTHROPIC_API_KEY in .env to enable LLM detection,\n      or pass --syntax mustache if your template uses {{...}}.\n`),
+      "red", err
+    ));
+    return EXIT.VALIDATION;
+  }
+
+  // Heuristic safety gate.
+  if (result.heuristicGate && !opts.yesHeuristic) {
+    if (process.stdin.isTTY && process.stderr.isTTY && !opts.json) {
+      err.write(paint(`note: tier 'heuristic' found these generic phrases:\n`, "yellow", err));
+      for (const p of result.placeholders) err.write(`  - ${p.first_seen_as}\n`);
+      const ok = await confirmTty("substitute these? [y/N] ");
+      if (!ok) {
+        err.write(paint("aborted (heuristic not confirmed). Pass --yes-heuristic to skip this prompt.\n", "yellow", err));
+        return EXIT.VALIDATION;
+      }
+    } else {
+      err.write(paint(
+        `warning: heuristic tier found ${result.placeholders.length} match(es) but --yes-heuristic was not given.\n` +
+        `nothing was substituted. matches: ${result.placeholders.map(p => p.first_seen_as).join(", ")}\n`,
+        "yellow", err
+      ));
+      return EXIT.VALIDATION;
+    }
+  }
+
+  // Orphan check.
+  const orphans = findOrphans(schema, result.placeholders);
+  if (orphans.length > 0) {
+    for (const o of orphans) {
+      err.write(paint(`error: schema declares "${o.key}" with aliases [${o.aliases.map(a => `"${a}"`).join(",")}], but no matching phrase was detected by tier '${result.tier}'.\n`, "red", err));
+      err.write(`hint: remove the entry from the schema, or add the phrase to the template.\n`);
+    }
+    return EXIT.VALIDATION;
+  }
+
+  const { resolved, missing, sources } = await resolveValues(result.placeholders, opts, paramsObj);
+  // Footgun guard: flag --typo'd-key VALUE that didn't match any detected
+  // placeholder. Without this warning, a typo'd flag is silently dropped and
+  // the user sees only a "missing required" error without the connection.
+  const declaredKeys = new Set(result.placeholders.map((p) => p.key));
+  const unusedFlags = Object.keys(opts.paramFlags).filter((k) => !declaredKeys.has(k));
+  for (const u of unusedFlags) {
+    result.warnings.push(`flag --${u.replace(/_/g, "-")} did not match any detected placeholder (possible typo?)`);
+  }
+  if (missing.length > 0) {
+    printMissing(missing, err);
+    if (unusedFlags.length > 0) {
+      err.write(paint(`note: you also passed ${unusedFlags.map(u => `--${u.replace(/_/g, "-")}`).join(", ")} which did not match any placeholder.\n`, "yellow", err));
+    }
+    return EXIT.VALIDATION;
+  }
+
+  // Diff mode: print a substitution table and exit without writing output.
+  if (opts.diff) {
+    if (opts.json) {
+      out.write(JSON.stringify({
+        ok: true,
+        tier: result.tier,
+        diff: result.placeholders.map((p) => ({
+          key: p.key,
+          from: `[${p.first_seen_as}]`,
+          to: resolved[p.key] !== undefined ? resolved[p.key] : null,
+          occurrences: p.occurrences,
+        })),
+      }, null, 2) + "\n");
+    } else {
+      out.write(buildDiffBlock(result.placeholders, resolved, { stream: out }));
+    }
+    return EXIT.OK;
+  }
+
+  const output = substitute(input.body, result.placeholders, resolved, result.tier);
+
+  // Write output.
+  if (opts.output) {
+    try { writeFileSync(opts.output, output, "utf8"); }
+    catch (e) {
+      err.write(paint(`error: could not write ${opts.output}: ${e.message}\n`, "red", err));
+      return EXIT.IO;
+    }
+  } else if (!opts.json) {
+    out.write(output);
+  }
+
+  if (opts.json) {
+    out.write(JSON.stringify({
+      ok: true,
+      tier: result.tier,
+      output_path: opts.output || null,
+      output: opts.output ? null : output,
+      placeholders: publicPlaceholders(result.placeholders),
+      sources,
+      warnings: result.warnings,
+      unmapped: result.unmapped,
+    }, null, 2) + "\n");
+  }
+
+  if (opts.why && !opts.json) {
+    err.write(buildWhyBlock({
+      inputDescriptor: describeInput(input),
+      schemaDescriptor: schema ? `${schema.sourcePath || "(parsed)"} (${schema.form} form)` : "(none, inferred)",
+      tier: result.tier,
+      placeholders: result.placeholders,
+      sources,
+      missing,
+      unmapped: result.unmapped,
+      warnings: result.warnings,
+      outputPath: opts.output,
+    }) + "\n");
+  }
+  for (const w of result.warnings) err.write(paint(`warning: ${w}\n`, "yellow", err));
+  return EXIT.OK;
+}
+
+function describeInput(input) {
+  if (input.path) return input.path;
+  if (input.kind === "text") return "stdin";
+  return "<docx>";
+}
+
+function printMissing(missing, err) {
+  err.write(paint("error: missing required parameter(s):\n", "red", err));
+  for (const m of missing) {
+    const flag = `--${m.key.replace(/_/g, "-")}`;
+    err.write(`  - ${m.key}   (matched: ${m.aliases.map(a => `[${a}]`).join(", ")})\n      supply ${flag} or set "${m.key}" in --params\n`);
+  }
+}
+
+async function confirmTty(prompt) {
+  return await new Promise((res) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(prompt, (a) => {
+      rl.close();
+      const v = a.trim().toLowerCase();
+      res(v === "y" || v === "yes");
+    });
+  });
+}
+
+// ─── COMPLETION ─────────────────────────────────────────────────────────────
+// Hand-rolled bash/zsh completion. No third-party generator. Install with:
+//   draft --completion bash >> ~/.bashrc        # bash
+//   draft --completion zsh  > ~/.zsh/_draft     # zsh (then add to fpath)
+
+const BOOLEAN_FLAGS_FOR_COMPLETION = [
+  "--help", "--version", "--demo", "--check-llm",
+  "--validate", "--list-placeholders", "--diff",
+  "--why", "--json", "--silent", "--interactive",
+  "--no-heuristic", "--yes-heuristic",
+  "--no-llm", "--llm",
+];
+
+const VALUE_FLAGS_FOR_COMPLETION = [
+  "--params", "--output", "--syntax", "--dictionary", "--completion",
+];
+
+/**
+ * Emit a shell completion script for the given shell.
+ *
+ * @param {"bash"|"zsh"} shell
+ * @returns {string} the completion script body.
+ * @throws {Error} with `.exitCode = EXIT.IO` for unsupported shells.
+ */
+export function completionScript(shell) {
+  if (shell === "bash") return bashCompletion();
+  if (shell === "zsh") return zshCompletion();
+  const e = new Error(`unsupported shell for completion: ${shell}`);
+  e.exitCode = EXIT.IO;
+  throw e;
+}
+
+function bashCompletion() {
+  const allFlags = [...BOOLEAN_FLAGS_FOR_COMPLETION, ...VALUE_FLAGS_FOR_COMPLETION].join(" ");
+  return `# bash completion for draft-cli — install with:
+#   draft --completion bash >> ~/.bashrc
+# or, for a single session:
+#   eval "$(draft --completion bash)"
+
+_draft_completion() {
+  local cur prev
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  case "$prev" in
+    --syntax)
+      COMPREPLY=( $(compgen -W "bracket mustache" -- "$cur") )
+      return 0
+      ;;
+    --completion)
+      COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+      return 0
+      ;;
+    --params|--dictionary)
+      COMPREPLY=( $(compgen -f -X '!*.json' -- "$cur") $(compgen -d -- "$cur") )
+      return 0
+      ;;
+    --output|-o)
+      COMPREPLY=( $(compgen -f -- "$cur") )
+      return 0
+      ;;
+  esac
+  if [[ "$cur" == --* ]]; then
+    COMPREPLY=( $(compgen -W "${allFlags}" -- "$cur") )
+  elif [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "-h -V -i -o -q ${allFlags}" -- "$cur") )
+  else
+    COMPREPLY=( $(compgen -f -- "$cur") )
+  fi
+  return 0
+}
+complete -F _draft_completion draft
+`;
+}
+
+function zshCompletion() {
+  return `#compdef draft
+# zsh completion for draft-cli — install with:
+#   draft --completion zsh > ~/.zsh/completions/_draft
+# and ensure ~/.zsh/completions is in fpath:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -U compinit && compinit
+
+_draft() {
+  local -a flags
+  flags=(
+    '--help[show help]'
+    '-h[show help]'
+    '--version[show version]'
+    '-V[show version]'
+    '--demo[bundled demo, no file needed]'
+    '--validate[completeness check, never writes output]'
+    '--list-placeholders[enumerate placeholders and exit]'
+    '--why[structured explanation to stderr]'
+    '--json[machine-readable output on stdout]'
+    '--silent[suppress all stderr output]'
+    '-q[suppress all stderr output]'
+    '--interactive[prompt for missing required params]'
+    '-i[prompt for missing required params]'
+    '--no-heuristic[disable tier 4]'
+    '--yes-heuristic[substitute tier-4 matches without confirmation]'
+    '--no-llm[disable tier 5 even when env is configured]'
+    '--llm[assert env-configured LLM, fail-fast if missing]'
+    '--check-llm[one-token roundtrip to verify provider config]'
+    '--diff[show substitution table without writing output]'
+    '--params[JSON params file]:params file:_files -g "*.json"'
+    '--output[output path]:output:_files'
+    '-o[output path]:output:_files'
+    '--syntax[placeholder convention]:syntax:(bracket mustache)'
+    '--dictionary[heuristic dictionary override]:dict:_files -g "*.json"'
+    '--completion[emit shell completion script]:shell:(bash zsh)'
+    '*:template:_files'
+  )
+  _arguments -s -S $flags
+}
+
+_draft "$@"
+`;
+}
+
+// ─── DOCTOR: --check-llm ────────────────────────────────────────────────────
+/**
+ * One-token roundtrip to the configured LLM provider. Confirms env, auth,
+ * and provider reachability without sending any template content. Useful in
+ * CI / startup health checks for agent-driven pipelines.
+ *
+ * Returns EXIT.OK on success, EXIT.LLM on provider error, EXIT.IO if no
+ * provider is configured.
+ *
+ * @param {Object<string, string>} envObj
+ * @param {NodeJS.WritableStream} out
+ * @param {NodeJS.WritableStream} err
+ * @param {{ fetcher?: typeof fetch }} [io]
+ * @returns {Promise<number>}
+ */
+export async function runCheckLlm(envObj, out, err, { fetcher } = {}) {
+  const provider = llmProviderFromEnv(envObj);
+  if (!provider) {
+    err.write(paint("error: no LLM provider configured in .env or process env.\n", "red", err));
+    err.write(`hint: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or the DRAFT_LLM_* triple.\n`);
+    return EXIT.IO;
+  }
+  err.write(paint(`checking ${provider.provider} (${provider.model || "default model"})…\n`, "cyan", err));
+  try {
+    const hits = await detectLlm("ping", provider, { fetcher });
+    // Regardless of what detectLlm returns, getting through the parse step
+    // without throwing means: auth ok, transport ok, response parseable.
+    out.write(`ok: ${provider.provider} reachable, ${provider.model || "default model"}\n`);
+    return EXIT.OK;
+  } catch (e) {
+    err.write(paint(`error: ${e.message}\n`, "red", err));
+    return e.exitCode || EXIT.LLM;
+  }
+}
+
+// ─── DIFF MODE ──────────────────────────────────────────────────────────────
+/**
+ * Build a per-placeholder substitution table for `--diff` mode. One line per
+ * placeholder showing what would change, plus a summary footer.
+ *
+ * @param {Placeholder[]} placeholders
+ * @param {Object<string, string>} resolved
+ * @param {{stream?: {isTTY?: boolean}}} [io]
+ * @returns {string}
+ */
+export function buildDiffBlock(placeholders, resolved, { stream } = {}) {
+  if (placeholders.length === 0) return "no changes (no placeholders detected).\n";
+  const maxFrom = Math.max(...placeholders.map((p) => `[${p.first_seen_as}]`.length));
+  const lines = [];
+  let totalSubstitutions = 0;
+  let unresolvedCount = 0;
+  for (const p of placeholders) {
+    const from = `[${p.first_seen_as}]`.padEnd(maxFrom);
+    const to = resolved[p.key];
+    if (to === undefined) {
+      lines.push(`  ${paint(from, "red", stream)}  →  ${paint("(unresolved)", "red", stream)}` +
+                 (p.occurrences > 1 ? `   ×${p.occurrences}` : ""));
+      unresolvedCount += 1;
+    } else {
+      lines.push(`  ${paint(from, "yellow", stream)}  →  ${paint(to, "green", stream)}` +
+                 (p.occurrences > 1 ? `   ×${p.occurrences}` : ""));
+      totalSubstitutions += p.occurrences;
+    }
+  }
+  lines.unshift("changes that would be made:");
+  lines.push("");
+  lines.push(`${placeholders.length} placeholder(s), ${totalSubstitutions} substitution(s), ${unresolvedCount} unresolved.`);
+  return lines.join("\n") + "\n";
+}
+
+// ─── DEMO (bundled fixture for the 30-second first run) ────────────────────
+export const DEMO_TEMPLATE = `# Mutual Non-Disclosure Agreement (demo)
+
+This Agreement is entered into on [Effective Date] between [Party A]
+and [Party B] (collectively, the "Parties").
+
+1. Confidentiality. [Party A] and [Party B] agree to keep confidential
+   any information disclosed under this Agreement.
+
+2. Term. This Agreement remains in effect for two years from the
+   [Effective Date].
+`;
+
+export const DEMO_VALUES = {
+  party_a: "Acme Corporation",
+  party_b: "Vendor Inc.",
+  effective_date: "2026-06-01",
+};
+
+export function runDemo(out, err) {
+  const hits = detectBracket(DEMO_TEMPLATE);
+  const byKey = new Map();
+  for (const h of hits) {
+    const key = canonicalKey(h.inner);
+    if (!byKey.has(key)) byKey.set(key, { key, hits: [] });
+    byKey.get(key).hits.push(h);
+  }
+  const placeholders = [...byKey.values()];
+  const output = substitute(DEMO_TEMPLATE, placeholders, DEMO_VALUES, "bracket");
+  err.write(paint("demo: substituting [Party A], [Party B], [Effective Date]\n", "cyan", err));
+  out.write(output);
+  err.write(paint("\nthis is what a real run looks like. try:\n", "dim", err));
+  err.write(`  draft your-template.md --party-a "Acme" --party-b "Vendor" --effective-date 2026-06-01\n`);
+  return EXIT.OK;
+}
+
+// ─── MAIN ───────────────────────────────────────────────────────────────────
+// A stderr-like sink that drops everything. Used when --silent is set so
+// downstream pipelines see zero stderr noise. Note: parse-time errors still
+// go to the real stderr (--silent isn't honored until args are parsed).
+const SILENT_STREAM = { write() {}, isTTY: false };
+
+/**
+ * The CLI entry point. Parses argv, resolves the input, runs the selected
+ * mode (draft / list-placeholders / validate / demo / completion), and
+ * returns the exit code.
+ *
+ * @param {string[]} argv — typically `process.argv.slice(2)`.
+ * @param {{
+ *   out?: NodeJS.WritableStream,
+ *   err?: NodeJS.WritableStream,
+ *   cwd?: string,
+ *   env?: Object<string, string>,
+ *   fetcher?: typeof fetch,
+ *   spawner?: typeof spawnSync,
+ *   stdinReader?: () => Promise<string>,
+ * }} [io] — injection seam for tests.
+ * @returns {Promise<number>} one of {@link EXIT}'s values.
+ */
+export async function main(argv, io = {}) {
+  const out = io.out || process.stdout;
+  const realErr = io.err || process.stderr;
+  const cwd = io.cwd || process.cwd();
+  const fetcher = io.fetcher;
+  const spawner = io.spawner || spawnSync;
+  const stdinReader = io.stdinReader || readStdin;
+  const processEnv = io.env || process.env;
+
+  let opts;
+  try { opts = parseArgs(argv); }
+  catch (e) {
+    realErr.write(paint(`error: ${e.message}\n`, "red", realErr));
+    realErr.write(`run \`draft --help\` for usage.\n`);
+    return EXIT.IO;
+  }
+
+  const err = opts.silent ? SILENT_STREAM : realErr;
+
+  if (opts.help) { out.write(HELP_TEXT); return EXIT.OK; }
+  if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
+  if (opts.completion) { out.write(completionScript(opts.completion)); return EXIT.OK; }
+  if (opts.demo) { return runDemo(out, err); }
+  if (opts.checkLlm) {
+    const envObj = effectiveEnv(cwd, processEnv);
+    return await runCheckLlm(envObj, out, err, { fetcher });
+  }
+
+  if (opts.positional.length === 0) {
+    err.write(paint(`error: no template given\n`, "red", err));
+    err.write(`run \`draft --help\` for usage.\n`);
+    return EXIT.IO;
+  }
+  if (opts.positional.length > 1) {
+    err.write(paint(`error: expected one template (got ${opts.positional.length})\n`, "red", err));
+    return EXIT.IO;
+  }
+
+  let input, schema, paramsObj, envObj;
+  try {
+    input = await resolveInput(opts.positional[0], { spawner, stdinReader });
+    schema = loadSchema(input.path);
+    paramsObj = loadParamsFile(opts.params);
+    envObj = effectiveEnv(cwd, processEnv);
+  } catch (e) {
+    err.write(paint(`error: ${e.message}\n`, "red", err));
+    return e.exitCode || EXIT.IO;
+  }
+
+  try {
+    if (opts.listPlaceholders) {
+      return await cmdListPlaceholders(opts, input, schema, envObj, { fetcher, out, err });
+    }
+    if (opts.validate) {
+      return await cmdValidate(opts, input, schema, paramsObj, envObj, { fetcher, out, err });
+    }
+    return await cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err });
+  } catch (e) {
+    err.write(paint(`error: ${e.message}\n`, "red", err));
+    return e.exitCode || EXIT.IO;
+  }
+}
+
+// Entry point: only run when invoked directly (not when imported by tests).
+const isMain = (() => {
+  try { return process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]); }
+  catch { return false; }
+})();
+if (isMain) {
+  main(process.argv.slice(2)).then((c) => process.exit(c)).catch((e) => {
+    process.stderr.write(`fatal: ${e && e.stack || e}\n`);
+    process.exit(1);
+  });
+}

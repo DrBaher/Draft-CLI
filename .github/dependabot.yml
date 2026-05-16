@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Runtime + dev npm deps. We have exactly one runtime dep (jszip);
+  # the bigger surface is jszip's transitive set, which dependabot will
+  # group into one PR per week.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      runtime:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps
+      include: scope
+
+  # GitHub Actions versions (actions/checkout, actions/setup-node, etc).
+  # Monthly is fine for these; they don't move often.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+      include: scope

@@ -1,0 +1,37 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Uses npm Trusted Publishing via OIDC. One-time setup at:
+#   https://www.npmjs.com/settings/<account>/trusted-publishers
+# Configure: repo = DrBaher/draft-cli, workflow = publish.yml, environment = npm
+# Once configured, NO npm token is needed in repo secrets.
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: verify version matches tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+      - run: npm publish --provenance --access public

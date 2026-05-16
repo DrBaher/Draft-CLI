@@ -1,0 +1,6 @@
+{
+  "party_a": ["Party A", "Disclosing Party"],
+  "party_b": ["Party B", "Receiving Party"],
+  "effective_date": ["Effective Date"],
+  "state_of_california": ["State of California"]
+}
