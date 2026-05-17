@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#fdfcf9"/>
+  <!-- document outline -->
+  <path d="M 130 100 L 320 100 L 380 160 L 380 410 L 130 410 Z"
+        fill="#fdfcf9" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
+  <!-- folded corner -->
+  <path d="M 320 100 L 380 160 L 320 160 Z"
+        fill="#1f7d5d" stroke="#1f7d5d" stroke-width="16" stroke-linejoin="round"/>
+  <!-- left bracket of placeholder -->
+  <path d="M 195 220 L 175 220 L 175 320 L 195 320"
+        fill="none" stroke="#1f7d5d" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- right bracket of placeholder -->
+  <path d="M 335 220 L 355 220 L 355 320 L 335 320"
+        fill="none" stroke="#1f7d5d" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- substituted content between brackets, suggesting the placeholder is being filled -->
+  <rect x="210" y="262" width="110" height="18" rx="5" fill="#0e4a37"/>
+</svg>
