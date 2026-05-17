@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file. The
 format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to semantic versioning once it leaves 0.x.
 
+## 0.8.2 — 2026-05-17
+
+### Docs
+
+- **Animated SVG demo embedded in README.** Self-contained
+  (`assets/demo.svg`, ~11 KB) — plays inline on github.com and
+  npmjs.com without an asciinema.org dependency. Shows
+  `--list-placeholders` then a `--diff` substitution against the
+  Common Paper Mutual NDA cover page fixture in `examples/`.
+- Strictly docs + assets; no code or behavior change.
+
 ## 0.8.1 — 2026-05-17
 
 ### Docs
