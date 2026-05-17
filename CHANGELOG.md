@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file. The
 format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to semantic versioning once it leaves 0.x.
 
+## 0.8.1 — 2026-05-17
+
+### Docs
+
+- **README refreshed for the v2 surface.** New "v2 features" section
+  with one-paragraph showcases for each shipped v2 capability (.docx
+  round-trip, typed parameters, computed placeholders, positional
+  addressing, `parties.json` registry, multi-document bundles,
+  `--from-deal` LLM inference). Command reference updated with new
+  flags + version annotations. Exit-code table updated with code 4
+  (validation / typed / computed / ref / positional) and code 5
+  (LLM). Intro paragraph rewritten to reflect the v2 capability
+  scope instead of just v1.
+- No code or behavior change. v0.8.0's API surface, schema contract,
+  and CLI flags are unchanged. Strictly a docs publish.
+
 ## 0.8.0 — 2026-05-17
 
 ### Added
