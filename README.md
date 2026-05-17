@@ -15,6 +15,10 @@ Agent-first placeholder-filler for legal-document templates. Reads bracketed (`[
 
 **The asymmetry is the architecture**: every step is deterministic and machine-driven except the values themselves — which can come from a flag, a params file, a parties registry, or an LLM extracting them from a prose deal description that a human wrote.
 
+<p align="center">
+  <img src="assets/demo.svg" alt="draft-cli demo: list placeholders then substitute against the Common Paper NDA cover page" width="900">
+</p>
+
 ## Run this
 
 ```bash
