@@ -221,12 +221,14 @@ Supported providers: Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`),
 `draft-cli` reads from stdin, writes to stdout by default, and exits with distinct codes for each failure class. It composes with `template-vault-cli` on the read side and `nda-review-cli` / `docx2pdf-cli` / `sign-cli` on the write side:
 
 ```bash
-# Pull a versioned template, fill it, hand it to review, convert to PDF, sign.
+# Read side — pull a versioned template and fill it from a free-form deal note
 template-vault get nda/house-mutual@v3 \
-  | draft - --from-deal deal-notes.txt --parties parties.json \
-  | nda-review --redline \
-  | docx2pdf - draft.pdf
-sign-cli send draft.pdf --signer counsel@counterparty.com
+  | draft - --from-deal deal-notes.txt --params parties.json > filled.md
+
+# Write side — review the draft (a gate), then render the agreed .docx and sign it offline
+nda-review-cli review --file filled.md --playbook policy.json --why
+docx2pdf agreed.docx agreed.pdf
+sign document agreed.pdf --signer "Counsel" --signer-email counsel@counterparty.com
 ```
 
 Each tool stays small and replaceable. None of them know about each other beyond the standard `stdin / stdout / argv / exit codes` contract.
