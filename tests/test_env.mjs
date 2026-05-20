@@ -1,7 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readDotenv, effectiveEnv, llmProviderFromEnv, colorEnabled, paint } from "../draft-cli.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { readDotenv, effectiveEnv, llmProviderFromEnv, llmProviderFromConfigFile, resolveLlmProvider, colorEnabled, paint } from "../draft-cli.mjs";
 import { tmp, makeFile } from "./_helpers.mjs";
+
+// Write a fake home with ~/.config/<dir>/llm.json and return the home path.
+function fakeHomeWithLlm(subdir, cfg) {
+  const home = tmp();
+  const dir = join(home, ".config", subdir);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "llm.json"), JSON.stringify(cfg), "utf8");
+  return home;
+}
 
 test("readDotenv parses simple KEY=VALUE pairs", () => {
   const dir = tmp();
@@ -62,6 +73,46 @@ test("llmProviderFromEnv picks OpenAI when OPENAI_API_KEY only", () => {
 
 test("llmProviderFromEnv returns null when no provider configured", () => {
   assert.equal(llmProviderFromEnv({}), null);
+});
+
+test("llmProviderFromConfigFile reads the suite-shared contract-ops/llm.json", () => {
+  const home = fakeHomeWithLlm("contract-ops", { provider: "openai", api_key: "fk", model: "gpt-foo" });
+  const cfg = llmProviderFromConfigFile(home);
+  assert.equal(cfg.provider, "openai");
+  assert.equal(cfg.apiKey, "fk");
+  assert.equal(cfg.model, "gpt-foo");
+});
+
+test("llmProviderFromConfigFile falls back to legacy ~/.config/draft-cli/llm.json", () => {
+  const home = fakeHomeWithLlm("draft-cli", { provider: "anthropic", api_key: "lk" });
+  const cfg = llmProviderFromConfigFile(home);
+  assert.equal(cfg.provider, "anthropic");
+  assert.equal(cfg.apiKey, "lk");
+  assert.equal(cfg.model, "claude-sonnet-4-6"); // default
+});
+
+test("llmProviderFromConfigFile returns null without home or api_key", () => {
+  assert.equal(llmProviderFromConfigFile(undefined), null);
+  const home = fakeHomeWithLlm("contract-ops", { provider: "openai" }); // no api_key
+  assert.equal(llmProviderFromConfigFile(home), null);
+});
+
+test("resolveLlmProvider: an env-configured provider wins over the config file", () => {
+  const home = fakeHomeWithLlm("contract-ops", { provider: "openai", api_key: "filekey" });
+  const cfg = resolveLlmProvider({ ANTHROPIC_API_KEY: "envkey", HOME: home });
+  assert.equal(cfg.provider, "anthropic"); // env beats the file
+  assert.equal(cfg.apiKey, "envkey");
+});
+
+test("resolveLlmProvider: falls back to the config file when env has no provider", () => {
+  const home = fakeHomeWithLlm("contract-ops", { provider: "openai", api_key: "filekey" });
+  const cfg = resolveLlmProvider({ HOME: home });
+  assert.equal(cfg.provider, "openai");
+  assert.equal(cfg.apiKey, "filekey");
+});
+
+test("resolveLlmProvider: null when neither env nor file configures a provider", () => {
+  assert.equal(resolveLlmProvider({ HOME: tmp() }), null); // empty home, no file
 });
 
 test("colorEnabled respects NO_COLOR and FORCE_COLOR", () => {

@@ -207,6 +207,51 @@ export function llmProviderFromEnv(envObj) {
   return null;
 }
 
+/**
+ * Read the suite-shared LLM config and return a provider in the same shape as
+ * {@link llmProviderFromEnv}, or null. Lookup order:
+ *   ~/.config/contract-ops/llm.json   (suite-wide, preferred)
+ *   ~/.config/draft-cli/llm.json      (legacy per-CLI fallback)
+ * Schema: { provider, model, api_key }. base_url is not yet honored by the
+ * provider path, matching the env-based config.
+ *
+ * @param {string|undefined} home — base home dir (usually `envObj.HOME`)
+ * @returns {LlmProvider | null}
+ */
+export function llmProviderFromConfigFile(home) {
+  if (!home) return null;
+  for (const path of [
+    join(home, ".config", "contract-ops", "llm.json"),
+    join(home, ".config", "draft-cli", "llm.json"),
+  ]) {
+    if (!existsSync(path)) continue;
+    let j;
+    try { j = JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+    const apiKey = j.api_key || j.apiKey;
+    if (!apiKey) return null;
+    const provider = String(j.provider || "anthropic").toLowerCase();
+    return {
+      provider,
+      apiKey,
+      model: j.model || (provider === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini"),
+    };
+  }
+  return null;
+}
+
+/**
+ * Resolve an LLM provider: environment first (a shell-exported key always
+ * wins), then the suite-shared config file. Command handlers use this so that
+ * configuring `~/.config/contract-ops/llm.json` once works across the suite.
+ *
+ * @param {Object<string, string>} envObj — usually from {@link effectiveEnv}
+ * @param {string} [home] — defaults to `envObj.HOME`
+ * @returns {LlmProvider | null}
+ */
+export function resolveLlmProvider(envObj, home = envObj && envObj.HOME) {
+  return llmProviderFromEnv(envObj) ?? llmProviderFromConfigFile(home);
+}
+
 // ─── ARG PARSING ────────────────────────────────────────────────────────────
 // Two-phase: known flags first, unknown --x VALUE pairs collected for later
 // param resolution. Boolean flags listed in KNOWN_BOOLEAN; value flags in
@@ -843,7 +888,7 @@ export async function inferFromDeal(dealText, placeholders, providerCfg, { fetch
     throw e;
   }
   if (!providerCfg) {
-    const e = new Error("--from-deal requires an LLM provider; set ANTHROPIC_API_KEY / OPENAI_API_KEY / DRAFT_LLM_* in .env");
+    const e = new Error("--from-deal requires an LLM provider; set ANTHROPIC_API_KEY / OPENAI_API_KEY / DRAFT_LLM_* (in .env or the environment), or write ~/.config/contract-ops/llm.json");
     e.exitCode = EXIT.LLM;
     throw e;
   }
@@ -1146,11 +1191,11 @@ export function parseSchema(parsed, sourceLabel = "<schema>") {
 export async function runCascade(input, opts, schema, envObj, { fetcher } = {}) {
   const warnings = [];
   const body = input.body;
-  const provider = llmProviderFromEnv(envObj);
+  const provider = resolveLlmProvider(envObj);
 
-  // Validate --llm up-front: if user asserts --llm, env must configure a provider.
+  // Validate --llm up-front: if user asserts --llm, a provider must be configured.
   if (opts.forceLlm && !provider) {
-    const e = new Error("--llm requires an LLM provider configured in .env or process env (ANTHROPIC_API_KEY, OPENAI_API_KEY, or DRAFT_LLM_*)");
+    const e = new Error("--llm requires an LLM provider: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or the DRAFT_LLM_* triple (in .env or the environment), or write ~/.config/contract-ops/llm.json");
     e.exitCode = EXIT.LLM;
     throw e;
   }
@@ -2384,7 +2429,7 @@ export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetc
   let inferred = null;
   if (dealText && !opts.noLlm) {
     try {
-      const r = await inferFromDeal(dealText, result.placeholders, llmProviderFromEnv(envObj), { fetcher });
+      const r = await inferFromDeal(dealText, result.placeholders, resolveLlmProvider(envObj), { fetcher });
       inferred = r.values;
       for (const k of r.extraKeys) {
         err.write(paint(`warning: --from-deal LLM emitted unknown key "${k}" (not in template/schema)\n`, "yellow", err));
@@ -2459,12 +2504,12 @@ export async function cmdValidate(opts, input, schema, paramsObj, envObj, { fetc
 export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher, out, err, parties = null, dealText = null } = {}) {
   const result = await runCascade(input, opts, schema, envObj, { fetcher });
   if (result.tier === "none") {
-    const hasProvider = Boolean(llmProviderFromEnv(envObj));
+    const hasProvider = Boolean(resolveLlmProvider(envObj));
     err.write(paint(
       `error: no placeholders detected by deterministic tiers (bracket, mustache, docx-highlight, heuristic).\n` +
       (hasProvider
         ? `hint: pass --llm to invoke LLM detection explicitly.\n`
-        : `hint: set ANTHROPIC_API_KEY in .env to enable LLM detection,\n      or pass --syntax mustache if your template uses {{...}}.\n`),
+        : `hint: set ANTHROPIC_API_KEY (in .env / env) or write ~/.config/contract-ops/llm.json to enable LLM detection,\n      or pass --syntax mustache if your template uses {{...}}.\n`),
       "red", err
     ));
     return EXIT.VALIDATION;
@@ -2513,7 +2558,7 @@ export async function cmdDraft(opts, input, schema, paramsObj, envObj, { fetcher
   let inferred = null;
   if (dealText && !opts.noLlm) {
     try {
-      const r = await inferFromDeal(dealText, result.placeholders, llmProviderFromEnv(envObj), { fetcher });
+      const r = await inferFromDeal(dealText, result.placeholders, resolveLlmProvider(envObj), { fetcher });
       inferred = r.values;
       for (const k of r.extraKeys) {
         err.write(paint(`warning: --from-deal LLM emitted unknown key "${k}" (not in template/schema)\n`, "yellow", err));
@@ -2995,10 +3040,10 @@ _draft "$@"
  * @returns {Promise<number>}
  */
 export async function runCheckLlm(envObj, out, err, { fetcher } = {}) {
-  const provider = llmProviderFromEnv(envObj);
+  const provider = resolveLlmProvider(envObj);
   if (!provider) {
-    err.write(paint("error: no LLM provider configured in .env or process env.\n", "red", err));
-    err.write(`hint: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or the DRAFT_LLM_* triple.\n`);
+    err.write(paint("error: no LLM provider configured.\n", "red", err));
+    err.write(`hint: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or the DRAFT_LLM_* triple (in .env or the environment), or write ~/.config/contract-ops/llm.json.\n`);
     return EXIT.IO;
   }
   err.write(paint(`checking ${provider.provider} (${provider.model || "default model"})…\n`, "cyan", err));

@@ -205,14 +205,14 @@ Exit codes: `0` ok · `1` i/o · `2` validation · `3` template-vault failure ·
 
 ## LLM tier (env-gated, opt-in)
 
-When tiers 1–4 all find nothing, `draft-cli` falls back to a language model **only if** a provider key is in the environment. Read order: `.env` in the working directory, then `process.env` (process wins).
+When tiers 1–4 all find nothing, `draft-cli` falls back to a language model **only if** a provider is configured. Resolution order: the environment first (`.env` in the working directory, then `process.env` — process wins), and if neither configures a provider, the suite-shared **`~/.config/contract-ops/llm.json`** (then the legacy `~/.config/draft-cli/llm.json`). Configure the shared file once and every contract-ops CLI that supports an LLM picks it up; an explicitly-exported env key always overrides it.
 
 ```sh
 echo 'ANTHROPIC_API_KEY=sk-ant-…' >> .env
 draft some-freeform-draft.md          # tier 5 auto-runs when 1-4 empty
 ```
 
-Supported providers: Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`), or explicit (`DRAFT_LLM_PROVIDER` + `DRAFT_LLM_API_KEY` + optional `DRAFT_LLM_MODEL`). The LLM receives template text only — no params file, no `.env` contents, no other data. Pass `--no-llm` to disable even when configured.
+Supported providers: Anthropic (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`), or explicit (`DRAFT_LLM_PROVIDER` + `DRAFT_LLM_API_KEY` + optional `DRAFT_LLM_MODEL`) — or a `{ "provider", "api_key", "model" }` object in `~/.config/contract-ops/llm.json`. The LLM receives template text only — no params file, no `.env` contents, no other data. Pass `--no-llm` to disable even when configured.
 
 **v0.8.0 inverse direction — `--from-deal PATH`:** feed prose deal notes and the LLM extracts values for the schema's placeholders (instead of inferring where placeholders are). Uses the same provider config. Errors on provider missing, network failure, or non-JSON response. CLI / `--params` values always win over LLM-inferred ones. See [PARAM_SCHEMA.md](PARAM_SCHEMA.md) §5.
 
