@@ -3210,6 +3210,17 @@ const SILENT_STREAM = { write() {}, isTTY: false };
  * }} [io] — injection seam for tests.
  * @returns {Promise<number>} one of {@link EXIT}'s values.
  */
+const DRAFT_FIRST_RUN_HINT = `draft — fill placeholders in a legal-document template (markdown or .docx).
+
+Try this:
+  draft --demo                                  zero-config demo, no files needed
+  draft <template> --list-placeholders --json   see what a template needs
+  draft <template> --party-a "Acme" -o out.md   fill and write
+
+Part of the contract-ops CLI suite: template-vault → draft → nda-review → compare → docx2pdf → sign.
+Docs: https://cli.drbaher.com/tools/draft-cli/  ·  draft --help
+`;
+
 export async function main(argv, io = {}) {
   const out = io.out || process.stdout;
   const realErr = io.err || process.stderr;
@@ -3228,6 +3239,9 @@ export async function main(argv, io = {}) {
   }
 
   const err = opts.silent ? SILENT_STREAM : realErr;
+
+  // Bare invocation (no args at all) → friendly first-run hint, not an error.
+  if (argv.length === 0) { out.write(DRAFT_FIRST_RUN_HINT); return EXIT.OK; }
 
   if (opts.help) { out.write(HELP_TEXT); return EXIT.OK; }
   if (opts.version) { out.write(`draft-cli ${VERSION}\n`); return EXIT.OK; }
