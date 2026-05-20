@@ -470,7 +470,7 @@ retry. This decision is logged in `PARAM_SCHEMA.md` §2.
 ## 0.1.0 — 2026-05-16
 
 Initial release. Single-file Node.js CLI for deterministic placeholder
-substitution in legal-document templates. Part of the contract-operations
+substitution in legal-document templates. Part of the contract-ops
 suite ([cli.drbaher.com](https://cli.drbaher.com)).
 
 ### Added

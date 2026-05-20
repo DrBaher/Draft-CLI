@@ -1,6 +1,6 @@
 # Agents
 
-Drive `draft-cli` from an LLM agent or non-interactive client. Same shape as the rest of the contract-operations suite.
+Drive `draft-cli` from an LLM agent or non-interactive client. Same shape as the rest of the contract-ops suite.
 
 ## Output contract
 

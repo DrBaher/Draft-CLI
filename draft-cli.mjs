@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // draft-cli — fill placeholders in legal-document templates.
-// Part of the contract-operations suite. MIT. See LICENSE.
+// Part of the contract-ops suite. MIT. See LICENSE.
 // Single-file Node.js CLI. Stdlib-only except `jszip` for .docx unzip.
 
 import { readFileSync, writeFileSync, existsSync, statSync, realpathSync } from "node:fs";
@@ -447,7 +447,7 @@ OPTIONS
 EXIT CODES
   0 ok   1 i/o error   2 validation   3 template-vault failure   4 llm failure
 
-Part of the contract-operations suite. See cli.drbaher.com.
+Part of the contract-ops suite. See cli.drbaher.com.
 `;
 
 /**

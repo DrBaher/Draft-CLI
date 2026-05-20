@@ -5,4 +5,4 @@ contact_links:
     about: For anything that could leak template content, params, or .env contents — please use the private security-advisory flow, NOT a public issue.
   - name: Suite landing page
     url: https://cli.drbaher.com
-    about: Overview of the contract-operations suite and how draft-cli fits.
+    about: Overview of the contract-ops suite and how draft-cli fits.

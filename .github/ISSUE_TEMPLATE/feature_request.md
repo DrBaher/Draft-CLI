@@ -12,7 +12,7 @@ manually fill in dollar amounts in YC SAFEs" is more useful than "add
 positional placeholder addressing."
 
 **What workflow does this fit?**
-Where in the contract-operations flow would this run? Standalone, or
+Where in the contract-ops flow would this run? Standalone, or
 chained with `template-vault-cli` / `nda-review-cli` / `docx2pdf-cli` /
 `sign-cli`?
 

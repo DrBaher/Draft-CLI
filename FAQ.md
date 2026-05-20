@@ -82,7 +82,7 @@ In interactive mode, you get a `y/N` prompt per run.
 
 ## Why is `draft-cli` Node.js and not Python? The other Python CLI uses pipx.
 
-The contract-operations suite has two Python CLIs (`template-vault-cli`,
+The contract-ops suite has two Python CLIs (`template-vault-cli`,
 `nda-review-cli` — both `pipx`-installed) and two JS CLIs (`docx2pdf-cli`,
 `sign-cli` — both `npm`/`npx`-installed). `draft-cli` joined the JS lane
 during the v1 design conversation, mirroring `docx2pdf-cli`'s posture

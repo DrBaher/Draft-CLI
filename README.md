@@ -4,7 +4,7 @@
 
 # draft-cli
 
-> Part of the contract-operations CLI suite. **draft-cli** (fill placeholders) → [**nda-review-cli**](https://github.com/DrBaher/nda-review-cli) (review, redline, negotiate) → [**docx2pdf-cli**](https://github.com/DrBaher/docx2pdf-cli) (DOCX → PDF) → [**sign-cli**](https://github.com/DrBaher/sign-cli) (signing + audit). Storage layer: [**template-vault-cli**](https://github.com/DrBaher/template-vault-cli). Drift detection: [**compare-cli**](https://github.com/DrBaher/compare-cli). [Showcase site](https://cli.drbaher.com/).
+> Part of the contract-ops CLI suite. **draft-cli** (fill placeholders) → [**nda-review-cli**](https://github.com/DrBaher/nda-review-cli) (review, redline, negotiate) → [**docx2pdf-cli**](https://github.com/DrBaher/docx2pdf-cli) (DOCX → PDF) → [**sign-cli**](https://github.com/DrBaher/sign-cli) (signing + audit). Storage layer: [**template-vault-cli**](https://github.com/DrBaher/template-vault-cli). Drift detection: [**compare-cli**](https://github.com/DrBaher/compare-cli). [Showcase site](https://cli.drbaher.com/).
 
 [![npm version](https://img.shields.io/npm/v/@drbaher/draft-cli.svg)](https://www.npmjs.com/package/@drbaher/draft-cli)
 [![npm downloads](https://img.shields.io/npm/dw/@drbaher/draft-cli.svg)](https://www.npmjs.com/package/@drbaher/draft-cli)
